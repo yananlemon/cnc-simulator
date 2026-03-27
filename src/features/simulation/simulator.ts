@@ -69,11 +69,13 @@ export interface SimulationPatch {
 
 export interface SimulationPreviewFrame {
   overview: ParseOverview;
+  frameIndex: number;
   completedSegments: number;
   totalSegments: number;
   percent: number;
   currentPoint: MotionPoint | null;
   generatedAtMs: number;
+  timelineMs: number;
   gridWidth: number;
   gridHeight: number;
   stock: StockConfig;
@@ -302,11 +304,13 @@ export async function simulateGcodeWithProgress(
   const heights = new Float32Array(gridWidth * gridHeight);
   const cuttingSegments = segments.filter((segment) => !segment.rapid);
   const totalSegments = cuttingSegments.length;
-  const baseBatchSize = Math.max(24, Math.floor(totalSegments / 120) || 48);
   let estimatedCutPixels = 0;
   let lastReportAt = -Infinity;
-  let lastPreviewAt = -Infinity;
   let batchesSinceYield = 0;
+  let previewFrameIndex = 0;
+  let accumulatedDirtyRange: DirtyRange | null = null;
+  let segmentsSincePreview = 0;
+  let lastPreviewPoint: MotionPoint | null = null;
 
   onProgress?.({
     stage: "准备仿真",
@@ -317,8 +321,8 @@ export async function simulateGcodeWithProgress(
   });
 
   for (let start = 0; start < totalSegments; ) {
-    speedGetter();
-    const batchSize = baseBatchSize;
+    const speed = speedGetter();
+    const batchSize = derivePreviewBatchSize(speed, totalSegments);
     const end = Math.min(totalSegments, start + batchSize);
     let dirtyRange: DirtyRange | null = null;
 
@@ -340,10 +344,15 @@ export async function simulateGcodeWithProgress(
     const completedSegments = end;
     const percent = Math.round((completedSegments / Math.max(totalSegments, 1)) * 100);
     const now = performance.now();
+    const currentPoint = cuttingSegments[Math.max(0, completedSegments - 1)]?.end ?? null;
 
-    // Keep preview generation dense and stable; playback speed is now controlled on the main thread.
+    if (dirtyRange) {
+      accumulatedDirtyRange = mergeDirtyRanges(accumulatedDirtyRange, dirtyRange);
+    }
+    segmentsSincePreview += end - start;
+
+    // Keep preview generation dense and deterministic; playback speed is controlled on the main thread.
     const reportIntervalMs = 80;
-    const previewIntervalMs = 24;
 
     if (completedSegments >= totalSegments || now - lastReportAt >= reportIntervalMs) {
       onProgress?.({
@@ -351,20 +360,29 @@ export async function simulateGcodeWithProgress(
         completedSegments,
         totalSegments,
         percent,
-        currentPoint: cuttingSegments[Math.max(0, completedSegments - 1)]?.end ?? null
+        currentPoint
       });
       lastReportAt = now;
     }
 
-    if (dirtyRange && (completedSegments >= totalSegments || now - lastPreviewAt >= previewIntervalMs)) {
+    const shouldEmitPreview =
+      accumulatedDirtyRange !== null &&
+      (completedSegments >= totalSegments ||
+        segmentsSincePreview >= derivePreviewEmitSegmentThreshold(speed) ||
+        movedEnoughForPreview(lastPreviewPoint, currentPoint, previewResolutionMm) ||
+        dirtyRangeLargeEnough(accumulatedDirtyRange, gridWidth, gridHeight));
+
+    if (shouldEmitPreview && accumulatedDirtyRange) {
       const summary = summarizeHeights(heights, previewResolutionMm);
       onPreview?.({
         overview,
+        frameIndex: previewFrameIndex,
         completedSegments,
         totalSegments,
         percent,
-        currentPoint: cuttingSegments[Math.max(0, completedSegments - 1)]?.end ?? null,
+        currentPoint,
         generatedAtMs: now,
+        timelineMs: previewFrameIndex * 16,
         gridWidth,
         gridHeight,
         stock,
@@ -373,15 +391,18 @@ export async function simulateGcodeWithProgress(
         maxSurfaceZMm: summary.maxSurfaceZMm,
         removedVolumeMm3: summary.removedVolumeMm3,
         estimatedCutPixels,
-        patch: buildSimulationPatch(heights, dirtyRange, gridWidth)
+        patch: buildSimulationPatch(heights, accumulatedDirtyRange, gridWidth)
       });
-      lastPreviewAt = now;
+      previewFrameIndex += 1;
+      accumulatedDirtyRange = null;
+      segmentsSincePreview = 0;
+      lastPreviewPoint = currentPoint;
     }
 
     start += batchSize;
     batchesSinceYield += 1;
 
-    const yieldEvery = 2;
+    const yieldEvery = speed >= 12 ? 4 : speed >= 4 ? 3 : 2;
     if (start < totalSegments && batchesSinceYield >= yieldEvery) {
       batchesSinceYield = 0;
       await waitForNextFrame();
@@ -551,11 +572,81 @@ function waitForNextFrame(): Promise<void> {
 }
 
 function derivePreviewResolution(stock: StockConfig, tool: ToolConfig): number {
-  return Math.max(stock.resolutionMm, Math.min(tool.diameterMm / 14, 0.1));
+  return Math.max(stock.resolutionMm, Math.min(tool.diameterMm / 24, 0.12));
 }
 
 function deriveFinalResolution(stock: StockConfig, tool: ToolConfig): number {
   return Math.max(0.01, Math.min(stock.resolutionMm, tool.diameterMm / 20, 0.08));
+}
+
+function derivePreviewBatchSize(speed: number, totalSegments: number): number {
+  if (speed <= 1) {
+    return Math.max(3, Math.min(6, Math.ceil(totalSegments / 2400) || 4));
+  }
+  if (speed <= 2) {
+    return 2;
+  }
+  if (speed <= 4) {
+    return 3;
+  }
+  if (speed <= 8) {
+    return 4;
+  }
+  return Math.max(4, Math.min(12, Math.ceil(totalSegments / 1200) || 6));
+}
+
+function derivePreviewEmitSegmentThreshold(speed: number): number {
+  if (speed <= 1) {
+    return 6;
+  }
+  if (speed <= 2) {
+    return 4;
+  }
+  if (speed <= 4) {
+    return 3;
+  }
+  return 2;
+}
+
+function movedEnoughForPreview(
+  previous: MotionPoint | null,
+  current: MotionPoint | null,
+  resolutionMm: number
+): boolean {
+  if (!previous || !current) {
+    return true;
+  }
+  const dx = current.x - previous.x;
+  const dy = current.y - previous.y;
+  const dz = current.z - previous.z;
+  return Math.hypot(dx, dy, dz) >= Math.max(resolutionMm * 1.2, 0.12);
+}
+
+function dirtyRangeLargeEnough(
+  dirtyRange: DirtyRange,
+  gridWidth: number,
+  gridHeight: number
+): boolean {
+  const patchWidth = dirtyRange.maxCol - dirtyRange.minCol + 1;
+  const patchHeight = dirtyRange.maxRow - dirtyRange.minRow + 1;
+  const patchArea = patchWidth * patchHeight;
+  const totalArea = gridWidth * gridHeight;
+  return patchArea >= Math.max(96, totalArea * 0.0035);
+}
+
+function mergeDirtyRanges(current: DirtyRange | null, next: DirtyRange | null): DirtyRange | null {
+  if (!next) {
+    return current;
+  }
+  if (!current) {
+    return next;
+  }
+  return {
+    minRow: Math.min(current.minRow, next.minRow),
+    maxRow: Math.max(current.maxRow, next.maxRow),
+    minCol: Math.min(current.minCol, next.minCol),
+    maxCol: Math.max(current.maxCol, next.maxCol)
+  };
 }
 
 export function exportSimulationToStl(
@@ -742,9 +833,10 @@ function computeSweptCutPoint(
 
   for (const t of evalPoints) {
     const r = Math.hypot(vx + t * dx, vy + t * dy);
-    if (r > radius) continue;
+    // Float precision causes r > radius at true boundary, skipping the cut entirely.
+    const clampedR = Math.min(r, radius);
     const zTip = segment.start.z + t * dz;
-    const cutZ = computeCutSurface(zTip, r, tool);
+    const cutZ = computeCutSurface(zTip, clampedR, tool);
     if (cutZ < bestZ) bestZ = cutZ;
   }
 

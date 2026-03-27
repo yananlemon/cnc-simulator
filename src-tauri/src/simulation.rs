@@ -57,6 +57,19 @@ pub struct SimulationResult {
     pub heights: Vec<f32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulationJobResult {
+    pub job_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulationTile {
+    pub job_id: u64,
+    pub start_row: usize,
+    pub row_count: usize,
+    pub heights: Vec<f32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct HeightField {
     cols: usize,
@@ -171,70 +184,55 @@ impl HeightField {
     }
 
     fn apply_segment(&mut self, segment: &MotionSegment, tool: &ToolSpec) -> Result<usize, String> {
-        let dx = segment.end.x - segment.start.x;
-        let dy = segment.end.y - segment.start.y;
-        let dz = segment.end.z - segment.start.z;
-        let length = (dx * dx + dy * dy + dz * dz).sqrt();
-
-        let step = derive_path_step(self.resolution_mm, tool);
-        let samples = ((length / step).ceil() as usize).max(1);
-
-        let mut affected = 0;
-        for index in 0..=samples {
-            let t = index as f64 / samples as f64;
-            let point = MotionPoint {
-                x: segment.start.x + dx * t,
-                y: segment.start.y + dy * t,
-                z: segment.start.z + dz * t,
-            };
-            affected += self.apply_tool_at_point(&point, tool)?;
-        }
-        Ok(affected)
-    }
-
-    fn apply_tool_at_point(&mut self, point: &MotionPoint, tool: &ToolSpec) -> Result<usize, String> {
         let radius = tool.diameter_mm * 0.5;
         if radius <= 0.0 {
             return Err("tool diameter must be positive".to_string());
         }
 
-        let local_x = point.x - self.origin_x_mm;
-        let local_y = point.y - self.origin_y_mm;
-        let col_center = (local_x / self.resolution_mm).round() as isize;
-        let row_center = (local_y / self.resolution_mm).round() as isize;
-        let reach = (radius / self.resolution_mm).ceil() as isize + 1;
-        let mut touched = 0usize;
+        let mut affected = 0;
 
-        for row in (row_center - reach)..=(row_center + reach) {
-            if row < 0 || row >= self.rows as isize {
-                continue;
-            }
-            for col in (col_center - reach)..=(col_center + reach) {
-                if col < 0 || col >= self.cols as isize {
-                    continue;
-                }
-                let world_x = self.origin_x_mm + col as f64 * self.resolution_mm;
-                let world_y = self.origin_y_mm + row as f64 * self.resolution_mm;
-                let cut_height = match compute_cell_cut_surface(
-                    point,
+        let min_x = segment.start.x.min(segment.end.x) - radius;
+        let max_x = segment.start.x.max(segment.end.x) + radius;
+        let min_y = segment.start.y.min(segment.end.y) - radius;
+        let max_y = segment.start.y.max(segment.end.y) + radius;
+
+        let start_col = ((min_x - self.origin_x_mm) / self.resolution_mm).floor() as isize;
+        let end_col = ((max_x - self.origin_x_mm) / self.resolution_mm).ceil() as isize;
+        let start_row = ((min_y - self.origin_y_mm) / self.resolution_mm).floor() as isize;
+        let end_row = ((max_y - self.origin_y_mm) / self.resolution_mm).ceil() as isize;
+
+        let start_col = start_col.max(0).min(self.cols as isize - 1) as usize;
+        let end_col = end_col.max(0).min(self.cols as isize - 1) as usize;
+        let start_row = start_row.max(0).min(self.rows as isize - 1) as usize;
+        let end_row = end_row.max(0).min(self.rows as isize - 1) as usize;
+
+        for row in start_row..=end_row {
+            let center_y = self.origin_y_mm + row as f64 * self.resolution_mm;
+            let row_offset = row * self.cols;
+            for col in start_col..=end_col {
+                let center_x = self.origin_x_mm + col as f64 * self.resolution_mm;
+
+                if let Some(cut_height) = compute_segment_cell_cut_surface(
+                    segment,
                     tool,
-                    world_x,
-                    world_y,
+                    center_x,
+                    center_y,
                     self.resolution_mm,
+                    radius,
                 )? {
-                    Some(height) => height,
-                    None => continue,
-                };
-                let cell = &mut self.data[row as usize * self.cols + col as usize];
-                if cut_height < *cell as f64 {
-                    *cell = cut_height.max(-self.thickness_mm) as f32;
-                    touched += 1;
+                    let cell = &mut self.data[row_offset + col];
+                    if cut_height < *cell as f64 {
+                        *cell = cut_height.max(-self.thickness_mm) as f32;
+                        affected += 1;
+                    }
                 }
             }
         }
 
-        Ok(touched)
+        Ok(affected)
     }
+
+
 }
 
 fn compute_cut_surface(z_tip: f64, radial: f64, tool: &ToolSpec) -> Result<f64, String> {
@@ -258,102 +256,74 @@ fn compute_cut_surface(z_tip: f64, radial: f64, tool: &ToolSpec) -> Result<f64, 
     }
 }
 
-fn compute_flat_cell_cut_surface(
+fn compute_segment_cell_cut_surface(
     segment: &MotionSegment,
+    tool: &ToolSpec,
     center_x: f64,
     center_y: f64,
     resolution_mm: f64,
     radius: f64,
-) -> Option<f64> {
-    let quarter = resolution_mm * 0.25;
-    let edge = resolution_mm * 0.4;
-    let sample_offsets = [
-        (0.0, 0.0),
-        (-quarter, -quarter),
-        (quarter, -quarter),
-        (-quarter, quarter),
-        (quarter, quarter),
-        (-edge, 0.0),
-        (edge, 0.0),
-        (0.0, -edge),
-        (0.0, edge),
-    ];
-
+) -> Result<Option<f64>, String> {
     let seg_dx = segment.end.x - segment.start.x;
     let seg_dy = segment.end.y - segment.start.y;
     let seg_len2 = seg_dx * seg_dx + seg_dy * seg_dy;
     let seg_dz = segment.end.z - segment.start.z;
 
-    let mut best: Option<f64> = None;
-    for (ox, oy) in sample_offsets {
-        let sample_x = center_x + ox;
-        let sample_y = center_y + oy;
+    let vx = segment.start.x - center_x;
+    let vy = segment.start.y - center_y;
 
-        let t = if seg_len2 <= f64::EPSILON {
-            0.0
-        } else {
-            let px = sample_x - segment.start.x;
-            let py = sample_y - segment.start.y;
-            ((px * seg_dx + py * seg_dy) / seg_len2).clamp(0.0, 1.0)
-        };
+    let a = seg_len2;
+    let b = 2.0 * (vx * seg_dx + vy * seg_dy);
+    let c = vx * vx + vy * vy - radius * radius;
 
-        let closest_x = segment.start.x + seg_dx * t;
-        let closest_y = segment.start.y + seg_dy * t;
-        let dx = sample_x - closest_x;
-        let dy = sample_y - closest_y;
-        let radial = (dx * dx + dy * dy).sqrt();
-        if radial > radius {
-            continue;
+    let mut t_in = 0.0;
+    let mut t_out = 1.0;
+
+    if a <= f64::EPSILON {
+        if c > 0.0 {
+            return Ok(None);
+        }
+    } else {
+        let discriminant = b * b - 4.0 * a * c;
+        if discriminant < 0.0 {
+            return Ok(None);
         }
 
-        let z_tip = segment.start.z + seg_dz * t;
-        best = Some(match best {
-            Some(current) => current.min(z_tip),
-            None => z_tip,
-        });
+        let sqrt_d = discriminant.sqrt();
+        let t1 = (-b - sqrt_d) / (2.0 * a);
+        let t2 = (-b + sqrt_d) / (2.0 * a);
+
+        t_in = t1.max(0.0);
+        t_out = t2.min(1.0);
+
+        if t_in > 1.0 || t_out < 0.0 || t_in > t_out {
+            return Ok(None);
+        }
     }
 
-    best
-}
-
-fn compute_cell_cut_surface(
-    point: &MotionPoint,
-    tool: &ToolSpec,
-    center_x: f64,
-    center_y: f64,
-    resolution_mm: f64,
-) -> Result<Option<f64>, String> {
-    let radius = tool.diameter_mm * 0.5;
-    let quarter = resolution_mm * 0.25;
-    let edge = resolution_mm * 0.4;
-    let sample_offsets = [
-        (0.0, 0.0),
-        (-quarter, -quarter),
-        (quarter, -quarter),
-        (-quarter, quarter),
-        (quarter, quarter),
-        (-edge, 0.0),
-        (edge, 0.0),
-        (0.0, -edge),
-        (0.0, edge),
-    ];
+    let t_span = t_out - t_in;
+    let physical_dist = t_span * seg_len2.sqrt();
+    
+    let num_samples = match tool.tool_type {
+        ToolType::FlatEndMill => 3,
+        _ => {
+            let step = (resolution_mm * 0.25).max(0.01);
+            ((physical_dist / step).ceil() as usize).max(3).min(50)
+        }
+    };
 
     let mut best: Option<f64> = None;
-    for (ox, oy) in sample_offsets {
-        let sample_x = center_x + ox;
-        let sample_y = center_y + oy;
-        let dx = sample_x - point.x;
-        let dy = sample_y - point.y;
-        let radial = (dx * dx + dy * dy).sqrt();
-        if radial > radius {
-            continue;
-        }
+    for i in 0..num_samples {
+        let frac = if num_samples <= 1 { 0.5 } else { i as f64 / (num_samples - 1) as f64 };
+        let t = t_in + frac * (t_out - t_in);
+        
+        let p_z = segment.start.z + t * seg_dz;
+        let dx = segment.start.x + t * seg_dx - center_x;
+        let dy = segment.start.y + t * seg_dy - center_y;
+        let radial = (dx * dx + dy * dy).sqrt().min(radius);
 
-        let cut = compute_cut_surface(point.z, radial, tool)?;
-        best = Some(match best {
-            Some(current) => current.min(cut),
-            None => cut,
-        });
+        let cut = compute_cut_surface(p_z, radial, tool)?;
+        best = Some(best.unwrap_or(cut).min(cut));
     }
 
     Ok(best)
@@ -361,12 +331,6 @@ fn compute_cell_cut_surface(
 
 fn derive_effective_resolution(stock: &StockSpec, tool: &ToolSpec) -> f64 {
     stock.resolution_mm.min(tool.diameter_mm / 20.0).clamp(0.02, 0.5)
-}
-
-fn derive_path_step(resolution_mm: f64, tool: &ToolSpec) -> f64 {
-    let resolution_target = (resolution_mm * 0.16).clamp(0.01, 0.04);
-    let tool_target = (tool.diameter_mm * 0.035).clamp(0.01, 0.05);
-    resolution_target.min(tool_target)
 }
 
 fn append_triangle(output: &mut String, a: [f32; 3], b: [f32; 3], c: [f32; 3]) {
@@ -388,6 +352,29 @@ pub fn run_simulation(request: &SimulationRequest) -> Result<SimulationResult, S
     Ok(SimulationResult {
         summary,
         heights: field.heights().to_vec(),
+    })
+}
+
+pub fn extract_tile(result: &SimulationResult, start_row: usize, row_count: usize) -> Result<SimulationTile, String> {
+    if row_count == 0 {
+        return Err("row_count must be positive".to_string());
+    }
+
+    let grid_width = result.summary.grid_width;
+    let grid_height = result.summary.grid_height;
+    if start_row >= grid_height {
+        return Err("start_row out of bounds".to_string());
+    }
+
+    let clamped_rows = row_count.min(grid_height - start_row);
+    let start_index = start_row * grid_width;
+    let end_index = start_index + clamped_rows * grid_width;
+
+    Ok(SimulationTile {
+        job_id: 0,
+        start_row,
+        row_count: clamped_rows,
+        heights: result.heights[start_index..end_index].to_vec(),
     })
 }
 

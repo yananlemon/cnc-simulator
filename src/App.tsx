@@ -31,9 +31,41 @@ interface RustSimulationSummary {
   estimated_cut_pixels: number;
 }
 
-interface RustSimulationResult {
-  summary: RustSimulationSummary;
+interface RustSimulationJobResult {
+  job_id: number;
+}
+
+interface RustSimulationTile {
+  job_id: number;
+  start_row: number;
+  row_count: number;
   heights: number[];
+}
+
+type RustSimulationJobStatus =
+  | { state: "running"; job_id: number }
+  | { state: "completed"; job_id: number; summary: RustSimulationSummary }
+  | { state: "failed"; job_id: number; message: string };
+
+type PlaybackPhase =
+  | "待机"
+  | "已加载文件"
+  | "解析完成"
+  | "重置毛坯"
+  | "已导出 STL"
+  | "缓冲过程帧"
+  | "播放切削过程"
+  | "等待最终高精度结果"
+  | "仿真完成"
+  | "仿真失败";
+
+interface PlaybackMetrics {
+  queueLength: number;
+  bufferedMs: number;
+  generatedFrames: number;
+  playedFrames: number;
+  previewProductionDone: boolean;
+  finalResultReady: boolean;
 }
 
 export function App() {
@@ -41,7 +73,8 @@ export function App() {
   const simulationWorkerRef = useRef<Worker | null>(null);
   const previewQueueRef = useRef<SimulationPreviewFrame[]>([]);
   const playbackRafRef = useRef<number | null>(null);
-  const playbackBudgetRef = useRef(0);
+  const playbackClockRef = useRef(0);
+  const lastPlaybackTickRef = useRef<number | null>(null);
   const playbackPrimedRef = useRef(false);
 
   const [fileName, setFileName] = useState("未导入文件");
@@ -65,13 +98,22 @@ export function App() {
   const [status, setStatus] = useState("请先导入 G-code 文件。");
   const [isSimulating, setIsSimulating] = useState(false);
   const [progress, setProgress] = useState(100);
-  const [phase, setPhase] = useState("待机");
+  const [computeProgress, setComputeProgress] = useState(0);
+  const [phase, setPhase] = useState<PlaybackPhase>("待机");
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [elapsedMs, setElapsedMs] = useState(0);
   const [logs, setLogs] = useState<string[]>(["系统启动完成", "等待导入 G-code 文件"]);
   const [showToolpath, setShowToolpath] = useState(false);
   const [simulationSpeed, setSimulationSpeed] = useState(1);
   const [pendingFinalResult, setPendingFinalResult] = useState<SimulationResult | null>(null);
+  const [playbackMetrics, setPlaybackMetrics] = useState<PlaybackMetrics>({
+    queueLength: 0,
+    bufferedMs: 0,
+    generatedFrames: 0,
+    playedFrames: 0,
+    previewProductionDone: false,
+    finalResultReady: false
+  });
 
   const parsedGcode = useMemo(() => parseGcode(gcode), [gcode]);
   const overview = parsedGcode.overview;
@@ -105,52 +147,90 @@ export function App() {
         cancelAnimationFrame(playbackRafRef.current);
         playbackRafRef.current = null;
       }
-      playbackBudgetRef.current = 0;
+      playbackClockRef.current = 0;
+      lastPlaybackTickRef.current = null;
       playbackPrimedRef.current = false;
       return;
     }
 
-    const tick = () => {
+    const tick = (timestamp: number) => {
       const queue = previewQueueRef.current;
+      const bufferedMs = getBufferedTimelineMs(queue);
+      setPlaybackMetrics((current) => ({
+        ...current,
+        queueLength: queue.length,
+        bufferedMs
+      }));
       if (!playbackPrimedRef.current) {
-        const bufferedMs =
-          queue.length >= 2 ? queue[queue.length - 1].generatedAtMs - queue[0].generatedAtMs : 0;
-        if (bufferedMs < 450 && !pendingFinalResult) {
+        if (bufferedMs < 1200 && !pendingFinalResult) {
+          setPhase("缓冲过程帧");
           playbackRafRef.current = requestAnimationFrame(tick);
           return;
         }
         playbackPrimedRef.current = true;
+        playbackClockRef.current = queue[0]?.timelineMs ?? 0;
+        lastPlaybackTickRef.current = timestamp;
       }
 
-      playbackBudgetRef.current += Math.max(0.5, simulationSpeed * 0.35);
-      const framesToConsume = Math.max(1, Math.floor(playbackBudgetRef.current));
+      const deltaMs =
+        lastPlaybackTickRef.current === null ? 16 : Math.max(0, timestamp - lastPlaybackTickRef.current);
+      lastPlaybackTickRef.current = timestamp;
+      playbackClockRef.current += deltaMs * simulationSpeed;
 
       if (queue.length > 0) {
         let latestFrame: SimulationPreviewFrame | null = null;
-        const consumeCount = Math.min(queue.length, framesToConsume);
-        for (let index = 0; index < consumeCount; index += 1) {
+        let consumeCount = 0;
+        while (queue.length > 0 && queue[0].timelineMs <= playbackClockRef.current) {
           latestFrame = queue.shift() ?? latestFrame;
+          consumeCount += 1;
         }
-        playbackBudgetRef.current = Math.max(0, playbackBudgetRef.current - consumeCount);
+        let extraSkips = getExtraSkipFrames(simulationSpeed, queue.length);
+        while (extraSkips > 0 && queue.length > 1) {
+          latestFrame = queue.shift() ?? latestFrame;
+          consumeCount += 1;
+          extraSkips -= 1;
+        }
+        if (!latestFrame && queue.length > 0) {
+          latestFrame = queue.shift() ?? latestFrame;
+          consumeCount = 1;
+        }
         if (latestFrame) {
+          setPhase("播放切削过程");
           setPreviewFrame(latestFrame);
           setCurrentToolPosition(latestFrame.currentPoint);
           setProgress(latestFrame.percent);
+          setPlaybackMetrics((current) => ({
+            ...current,
+            queueLength: queue.length,
+            bufferedMs: getBufferedTimelineMs(queue),
+            playedFrames: current.playedFrames + consumeCount
+          }));
         }
       } else if (pendingFinalResult) {
-        setSimulation(pendingFinalResult);
-        setPendingFinalResult(null);
+        setPhase("等待最终高精度结果");
+        setStatus("高精度结果已完成，正在切换最终网格...");
         setPreviewFrame(null);
         setCurrentToolPosition(null);
+        setSimulation(pendingFinalResult);
+        setPendingFinalResult(null);
         setProgress(100);
         setPhase("仿真完成");
         setStatus(`仿真完成，已处理 ${pendingFinalResult.overview.cuttingSegmentCount} 段切削轨迹。`);
         appendLog(`仿真完成，处理 ${pendingFinalResult.overview.cuttingSegmentCount} 段切削轨迹`);
         setIsSimulating(false);
+        setComputeProgress(100);
+        setPlaybackMetrics((current) => ({
+          ...current,
+          queueLength: 0,
+          bufferedMs: 0
+        }));
         playbackRafRef.current = null;
-        playbackBudgetRef.current = 0;
+        playbackClockRef.current = 0;
+        lastPlaybackTickRef.current = null;
         playbackPrimedRef.current = false;
         return;
+      } else if (queue.length === 0 && playbackMetrics.previewProductionDone) {
+        setPhase("等待最终高精度结果");
       }
 
       playbackRafRef.current = requestAnimationFrame(tick);
@@ -164,7 +244,7 @@ export function App() {
         playbackRafRef.current = null;
       }
     };
-  }, [isSimulating, simulationSpeed, pendingFinalResult]);
+  }, [isSimulating, simulationSpeed, pendingFinalResult, playbackMetrics.previewProductionDone]);
 
   const appendLog = (message: string) => {
     const timestamp = new Date().toLocaleTimeString("zh-CN", {
@@ -198,11 +278,21 @@ export function App() {
     setPendingFinalResult(null);
     setCurrentToolPosition(null);
     previewQueueRef.current = [];
-    playbackBudgetRef.current = 0;
+    playbackClockRef.current = 0;
+    lastPlaybackTickRef.current = null;
     playbackPrimedRef.current = false;
     setProgress(0);
+    setComputeProgress(0);
     setPhase("已加载文件");
     setStatus(`已加载 ${file.name}，毛坯已按刀路范围自动生成。`);
+    setPlaybackMetrics({
+      queueLength: 0,
+      bufferedMs: 0,
+      generatedFrames: 0,
+      playedFrames: 0,
+      previewProductionDone: false,
+      finalResultReady: false
+    });
     appendLog(`导入文件 ${file.name}`);
   };
 
@@ -223,13 +313,24 @@ export function App() {
     setPendingFinalResult(null);
     setCurrentToolPosition(null);
     previewQueueRef.current = [];
-    playbackBudgetRef.current = 0;
-    setPhase("准备仿真");
+    playbackClockRef.current = 0;
+    lastPlaybackTickRef.current = null;
+    playbackPrimedRef.current = false;
+    setPhase("缓冲过程帧");
     setProgress(0);
+    setComputeProgress(0);
     const runStartedAt = Date.now();
     setStartedAt(runStartedAt);
     setElapsedMs(0);
-    setStatus("正在准备仿真...");
+    setPlaybackMetrics({
+      queueLength: 0,
+      bufferedMs: 0,
+      generatedFrames: 0,
+      playedFrames: 0,
+      previewProductionDone: false,
+      finalResultReady: false
+    });
+    setStatus("正在准备过程缓冲与最终高精度仿真...");
     appendLog("开始执行仿真");
 
     try {
@@ -239,27 +340,36 @@ export function App() {
       });
       simulationWorkerRef.current = worker;
 
-      const result = await new Promise<SimulationResult>((resolve, reject) => {
+      const previewCompletion = new Promise<SimulationResult>((resolve, reject) => {
         worker.onmessage = (message: MessageEvent<SimulationWorkerOutgoing>) => {
           const event = message.data;
 
           if (event.type === "progress") {
             const next = event.payload;
-            setPhase(next.stage);
-            setProgress(next.percent);
-            setCurrentToolPosition(next.currentPoint);
-            setStatus(`${next.stage}：${next.completedSegments} / ${next.totalSegments} 段，完成 ${next.percent}%`);
+            setComputeProgress(next.percent);
+            setStatus(
+              `过程计算：${next.completedSegments} / ${next.totalSegments} 段，已完成 ${next.percent}%`
+            );
             return;
-
-
           }
 
           if (event.type === "preview") {
             previewQueueRef.current.push(event.payload);
+            setPlaybackMetrics((current) => ({
+              ...current,
+              generatedFrames: current.generatedFrames + 1,
+              queueLength: previewQueueRef.current.length,
+              bufferedMs: getBufferedTimelineMs(previewQueueRef.current)
+            }));
             return;
           }
 
           if (event.type === "complete") {
+            setComputeProgress(100);
+            setPlaybackMetrics((current) => ({
+              ...current,
+              previewProductionDone: true
+            }));
             resolve(event.payload);
             return;
           }
@@ -282,15 +392,25 @@ export function App() {
         });
       });
 
+      const finalResultPromise = simulateWithRustKernel(gcode, stock, tool, overview);
+      const previewResult = await previewCompletion;
+      const finalResult = (await finalResultPromise) ?? previewResult;
+
       setElapsedMs(Date.now() - runStartedAt);
-      setPendingFinalResult(result);
-      setPhase("播放切削过程");
-      setStatus(`计算已完成，正在按当前速度播放 ${result.overview.cuttingSegmentCount} 段切削轨迹。`);
-      appendLog(`计算完成，开始播放 ${result.overview.cuttingSegmentCount} 段切削轨迹`);
+      setPendingFinalResult(finalResult);
+      setPlaybackMetrics((current) => ({
+        ...current,
+        finalResultReady: true
+      }));
+      setStatus(
+        `过程帧已缓存完成，正在按当前速度播放 ${previewResult.overview.cuttingSegmentCount} 段切削轨迹。`
+      );
+      appendLog(`过程帧生成完成，等待播放结束后切换最终高精度结果`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "未知错误";
       previewQueueRef.current = [];
-      playbackBudgetRef.current = 0;
+      playbackClockRef.current = 0;
+      lastPlaybackTickRef.current = null;
       playbackPrimedRef.current = false;
       setPreviewFrame(null);
       setPendingFinalResult(null);
@@ -299,6 +419,15 @@ export function App() {
       setStatus(`仿真失败：${message}`);
       appendLog(`仿真失败：${message}`);
       setIsSimulating(false);
+      setComputeProgress(0);
+      setPlaybackMetrics({
+        queueLength: 0,
+        bufferedMs: 0,
+        generatedFrames: 0,
+        playedFrames: 0,
+        previewProductionDone: false,
+        finalResultReady: false
+      });
     } finally {
       simulationWorkerRef.current?.terminate();
       simulationWorkerRef.current = null;
@@ -355,11 +484,21 @@ export function App() {
     setPendingFinalResult(null);
     setCurrentToolPosition(null);
     previewQueueRef.current = [];
-    playbackBudgetRef.current = 0;
+    playbackClockRef.current = 0;
+    lastPlaybackTickRef.current = null;
     playbackPrimedRef.current = false;
     setProgress(0);
+    setComputeProgress(0);
     setPhase("重置毛坯");
     setStatus("已手动生成空白毛坯。");
+    setPlaybackMetrics({
+      queueLength: 0,
+      bufferedMs: 0,
+      generatedFrames: 0,
+      playedFrames: 0,
+      previewProductionDone: false,
+      finalResultReady: false
+    });
     appendLog("重新生成空白毛坯尺寸");
   };
   return (
@@ -399,6 +538,10 @@ export function App() {
             stock={stock}
             tool={tool}
             simulation={simulation}
+            computeProgress={computeProgress}
+            playbackState={describePlaybackState(phase, playbackMetrics)}
+            queueLength={playbackMetrics.queueLength}
+            bufferedMs={playbackMetrics.bufferedMs}
           />
         </div>
         <main className="stage-shell">
@@ -424,6 +567,10 @@ export function App() {
             progress={progress}
             speedMultiplier={simulationSpeed}
             onSpeedChange={setSimulationSpeed}
+            playbackState={describePlaybackState(phase, playbackMetrics)}
+            computeProgress={computeProgress}
+            queueLength={playbackMetrics.queueLength}
+            bufferedMs={playbackMetrics.bufferedMs}
           />
         </main>
       </div>
@@ -452,6 +599,48 @@ function sanitizeSolidName(fileName: string): string {
   return fileName.replace(/\.[^.]+$/, "").replace(/[^a-zA-Z0-9_-]+/g, "_") || "artimaker_relief";
 }
 
+function getBufferedTimelineMs(queue: SimulationPreviewFrame[]): number {
+  return queue.length >= 2 ? queue[queue.length - 1].timelineMs - queue[0].timelineMs : 0;
+}
+
+function describePlaybackState(phase: PlaybackPhase, metrics: PlaybackMetrics): string {
+  if (phase === "缓冲过程帧") {
+    return `缓冲中（${metrics.queueLength} 帧）`;
+  }
+  if (phase === "播放切削过程") {
+    return `播放中（已播 ${metrics.playedFrames} / 产出 ${metrics.generatedFrames}）`;
+  }
+  if (phase === "等待最终高精度结果") {
+    return metrics.finalResultReady ? "等待播放结束切换最终结果" : "等待高精度结果";
+  }
+  return phase;
+}
+
+function getExtraSkipFrames(speed: number, queueLength: number): number {
+  if (queueLength <= 2) {
+    return 0;
+  }
+  if (speed >= 32) {
+    return Math.min(queueLength - 1, 10);
+  }
+  if (speed >= 24) {
+    return Math.min(queueLength - 1, 8);
+  }
+  if (speed >= 16) {
+    return Math.min(queueLength - 1, 6);
+  }
+  if (speed >= 12) {
+    return Math.min(queueLength - 1, 4);
+  }
+  if (speed >= 8) {
+    return Math.min(queueLength - 1, 2);
+  }
+  if (speed >= 4) {
+    return 1;
+  }
+  return 0;
+}
+
 function isTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
@@ -467,40 +656,77 @@ async function simulateWithRustKernel(
   }
 
   const { invoke } = await import("@tauri-apps/api/core");
-  const rustResult = await invoke<RustSimulationResult>("simulate_gcode", {
-    request: {
-      gcode,
-      stock: {
-        width_mm: stock.widthMm,
-        height_mm: stock.heightMm,
-        thickness_mm: stock.thicknessMm,
-        resolution_mm: stock.resolutionMm,
-        origin_x_mm: stock.originXMm,
-        origin_y_mm: stock.originYMm
-      },
-      tool: {
-        tool_type: tool.toolType,
-        diameter_mm: tool.diameterMm,
-        angle_deg: tool.toolType === "v_bit" ? tool.angleDeg : null
-      }
+  const request = {
+    gcode,
+    stock: {
+      width_mm: stock.widthMm,
+      height_mm: stock.heightMm,
+      thickness_mm: stock.thicknessMm,
+      resolution_mm: stock.resolutionMm,
+      origin_x_mm: stock.originXMm,
+      origin_y_mm: stock.originYMm
+    },
+    tool: {
+      tool_type: tool.toolType,
+      diameter_mm: tool.diameterMm,
+      angle_deg: tool.toolType === "v_bit" ? tool.angleDeg : null
     }
+  };
+
+  const job = await invoke<RustSimulationJobResult>("simulate_gcode_cached", {
+    request
   });
+
+  let summary: RustSimulationSummary | null = null;
+  while (!summary) {
+    const status = await invoke<RustSimulationJobStatus>("get_simulation_job_status", {
+      jobId: job.job_id
+    });
+    if (status.state === "completed") {
+      summary = status.summary;
+      break;
+    }
+    if (status.state === "failed") {
+      throw new Error(status.message);
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 120));
+  }
+
+  const heights = new Float32Array(summary.grid_width * summary.grid_height);
+  const tileRows = Math.min(48, Math.max(12, Math.floor(8192 / Math.max(1, summary.grid_width))));
+
+  try {
+    for (let startRow = 0; startRow < summary.grid_height; startRow += tileRows) {
+      const tile = await invoke<RustSimulationTile>("get_simulation_tile", {
+        jobId: job.job_id,
+        startRow,
+        rowCount: tileRows
+      });
+      heights.set(tile.heights, tile.start_row * summary.grid_width);
+
+      // Yield to the UI thread between tiles so the desktop window stays responsive while
+      // the high-precision result is being reconstructed on the frontend side.
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    }
+  } finally {
+    await invoke("release_simulation_job", { jobId: job.job_id }).catch(() => null);
+  }
 
   return {
     overview: {
       ...overview,
-      segmentCount: rustResult.summary.segment_count,
-      cuttingSegmentCount: rustResult.summary.cutting_segment_count
+      segmentCount: summary.segment_count,
+      cuttingSegmentCount: summary.cutting_segment_count
     },
-    gridWidth: rustResult.summary.grid_width,
-    gridHeight: rustResult.summary.grid_height,
+    gridWidth: summary.grid_width,
+    gridHeight: summary.grid_height,
     stock,
-    cellResolutionMm: rustResult.summary.resolution_mm,
-    minSurfaceZMm: rustResult.summary.min_height_mm,
-    maxSurfaceZMm: rustResult.summary.max_height_mm,
-    removedVolumeMm3: rustResult.summary.removed_volume_mm3,
-    estimatedCutPixels: rustResult.summary.estimated_cut_pixels,
-    heights: Float32Array.from(rustResult.heights)
+    cellResolutionMm: summary.resolution_mm,
+    minSurfaceZMm: summary.min_height_mm,
+    maxSurfaceZMm: summary.max_height_mm,
+    removedVolumeMm3: summary.removed_volume_mm3,
+    estimatedCutPixels: summary.estimated_cut_pixels,
+    heights
   };
 }
 

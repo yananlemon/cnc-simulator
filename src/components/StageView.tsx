@@ -58,6 +58,7 @@ interface ReliefState {
   rightWall: Mesh;
   gridWidth: number;
   gridHeight: number;
+  fullDetailReady: boolean;
 }
 
 export function StageView({
@@ -84,6 +85,7 @@ export function StageView({
   const toolIndicatorRef = useRef<Group | null>(null);
   const toolpathLinesRef = useRef<LineSegments | null>(null);
   const animationFrameRef = useRef<number | null>(null);
+  const finalApplyRafRef = useRef<number | null>(null);
 
   const stats = useMemo(() => {
     const surface = simulation ?? previewFrame;
@@ -222,6 +224,9 @@ export function StageView({
       if (animationFrameRef.current !== null) {
         window.cancelAnimationFrame(animationFrameRef.current);
       }
+      if (finalApplyRafRef.current !== null) {
+        window.cancelAnimationFrame(finalApplyRafRef.current);
+      }
 
       controls.dispose();
       renderer.dispose();
@@ -245,8 +250,100 @@ export function StageView({
   }, [stock, tool]);
 
   useEffect(() => {
-    syncSimulationMesh(finalReliefStateRef, stockGroupRef, stock, simulation, false);
-  }, [simulation, stock]);
+    const reliefState = ensureReliefState(
+      finalReliefStateRef,
+      stockGroupRef,
+      stock,
+      simulation?.gridWidth ?? null,
+      simulation?.gridHeight ?? null,
+      false
+    );
+
+    if (!reliefState) {
+      return;
+    }
+
+    if (finalApplyRafRef.current !== null) {
+      window.cancelAnimationFrame(finalApplyRafRef.current);
+      finalApplyRafRef.current = null;
+    }
+
+    if (!simulation) {
+      applySimulationToRelief(reliefState, null, stock);
+      reliefState.mesh.visible = !isSimulating;
+      reliefState.frontWall.visible = !isSimulating;
+      reliefState.backWall.visible = !isSimulating;
+      reliefState.leftWall.visible = !isSimulating;
+      reliefState.rightWall.visible = !isSimulating;
+      return;
+    }
+
+    const positions = reliefState.mesh.geometry.getAttribute("position") as BufferAttribute;
+    let colorAttr = reliefState.mesh.geometry.getAttribute("color") as BufferAttribute | undefined;
+    if (!colorAttr) {
+      const count = positions.count;
+      colorAttr = new Float32BufferAttribute(new Float32Array(count * 3), 3);
+      reliefState.mesh.geometry.setAttribute("color", colorAttr);
+    }
+
+    reliefState.mesh.visible = false;
+    reliefState.frontWall.visible = false;
+    reliefState.backWall.visible = false;
+    reliefState.leftWall.visible = false;
+    reliefState.rightWall.visible = false;
+
+    const minH = simulation.minSurfaceZMm;
+    const maxH = simulation.maxSurfaceZMm;
+    const range = Math.max(0.001, maxH - minH);
+    const chunkSize = 24000;
+    let cursor = 0;
+
+    const finalizeMesh = () => {
+      reliefState.mesh.geometry.computeVertexNormals();
+      reliefState.mesh.geometry.getAttribute("position").needsUpdate = true;
+      reliefState.mesh.geometry.getAttribute("normal").needsUpdate = true;
+      updateReliefWalls(reliefState, stock, (row, col) => sampleDisplayHeight(simulation, row, col));
+      reliefState.mesh.visible = true;
+      reliefState.frontWall.visible = true;
+      reliefState.backWall.visible = true;
+      reliefState.leftWall.visible = true;
+      reliefState.rightWall.visible = true;
+      reliefState.fullDetailReady = true;
+      finalApplyRafRef.current = null;
+    };
+
+    const applyChunk = () => {
+      const end = Math.min(cursor + chunkSize, positions.count);
+      for (let index = cursor; index < end; index += 1) {
+        const row = Math.floor(index / reliefState.gridWidth);
+        const col = index - row * reliefState.gridWidth;
+        const sourceHeight = sampleDisplayHeight(simulation, row, col);
+        positions.setZ(index, stock.thicknessMm + sourceHeight);
+        const t = (sourceHeight - minH) / range;
+        colorAttr!.setXYZ(index, 0.12 + t * 0.83, 0.1 + t * 0.78, 0.08 + t * 0.67);
+      }
+
+      positions.needsUpdate = true;
+      colorAttr!.needsUpdate = true;
+      cursor = end;
+
+      if (cursor < positions.count) {
+        finalApplyRafRef.current = window.requestAnimationFrame(applyChunk);
+        return;
+      }
+
+      finalApplyRafRef.current = window.requestAnimationFrame(finalizeMesh);
+    };
+
+    finalApplyRafRef.current = window.requestAnimationFrame(applyChunk);
+
+    return () => {
+      if (finalApplyRafRef.current !== null) {
+        window.cancelAnimationFrame(finalApplyRafRef.current);
+        finalApplyRafRef.current = null;
+      }
+    };
+  }, [simulation, stock, isSimulating]);
 
   useEffect(() => {
     const setReliefVisibility = (state: ReliefState | null, visible: boolean) => {
@@ -300,10 +397,10 @@ export function StageView({
     }
 
     previewState.mesh.visible = isSimulating;
-    previewState.frontWall.visible = isSimulating;
-    previewState.backWall.visible = isSimulating;
-    previewState.leftWall.visible = isSimulating;
-    previewState.rightWall.visible = isSimulating;
+    previewState.frontWall.visible = false;
+    previewState.backWall.visible = false;
+    previewState.leftWall.visible = false;
+    previewState.rightWall.visible = false;
     applyPreviewPatchToRelief(previewState, previewFrame, stock);
   }, [previewFrame, isSimulating, stock]);
 
@@ -415,7 +512,8 @@ function createReliefState(
     leftWall,
     rightWall,
     gridWidth: resolvedGridWidth,
-    gridHeight: resolvedGridHeight
+    gridHeight: resolvedGridHeight,
+    fullDetailReady: false
   };
 }
 
@@ -552,24 +650,9 @@ function applySimulationToRelief(
     reliefState.mesh.geometry.setAttribute("color", colorAttr);
   }
 
-  // First pass: collect min/max heights for normalization
-  let minH = 0;
-  let maxH = 0;
-  if (simulation) {
-    for (let row = 0; row < reliefState.gridHeight; row += 1) {
-      for (let col = 0; col < reliefState.gridWidth; col += 1) {
-        const h = sampleDisplayHeight(simulation, row, col);
-        if (h < minH) minH = h;
-        if (h > maxH) maxH = h;
-      }
-    }
-  }
-  const range = maxH - minH;
-
-  console.log('[RELIEF DEBUG] grid:', reliefState.gridWidth, 'x', reliefState.gridHeight,
-    'sim grid:', simulation?.gridWidth, 'x', simulation?.gridHeight,
-    'minH:', minH.toFixed(3), 'maxH:', maxH.toFixed(3), 'range:', range.toFixed(3),
-    'positions count:', positions.count);
+  const minH = simulation?.minSurfaceZMm ?? 0;
+  const maxH = simulation?.maxSurfaceZMm ?? 0;
+  const range = Math.max(0.001, maxH - minH);
 
   for (let row = 0; row < reliefState.gridHeight; row += 1) {
     for (let col = 0; col < reliefState.gridWidth; col += 1) {
@@ -593,6 +676,7 @@ function applySimulationToRelief(
   colorAttr.needsUpdate = true;
   reliefState.mesh.geometry.computeVertexNormals();
   updateReliefWalls(reliefState, stock, (row, col) => (simulation ? sampleDisplayHeight(simulation, row, col) : 0));
+  reliefState.fullDetailReady = true;
 }
 
 let previewPatchCounter = 0;
@@ -646,12 +730,12 @@ function applyPreviewPatchToRelief(
   positions.needsUpdate = true;
   colorAttr.needsUpdate = true;
 
-  // Only recompute expensive normals and walls every 8th frame to avoid main-thread lag
+  // During playback keep the main thread light: avoid rebuilding normals and wall meshes on every preview patch.
   previewPatchCounter += 1;
-  if (previewPatchCounter % 8 === 0) {
+  if (previewPatchCounter % 24 === 0) {
     reliefState.mesh.geometry.computeVertexNormals();
-    updateReliefWalls(reliefState, stock, (row, col) => samplePreviewHeight(previewFrame, row, col));
   }
+  reliefState.fullDetailReady = false;
 }
 
 function resetReliefMesh(reliefState: ReliefState, stock: StockConfig): void {
@@ -664,6 +748,7 @@ function resetReliefMesh(reliefState: ReliefState, stock: StockConfig): void {
   positions.needsUpdate = true;
   reliefState.mesh.geometry.computeVertexNormals();
   updateReliefWalls(reliefState, stock, () => 0);
+  reliefState.fullDetailReady = true;
 }
 
 function createToolIndicator(tool: ToolConfig, stock: StockConfig): Group {

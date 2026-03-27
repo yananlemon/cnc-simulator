@@ -17,6 +17,10 @@ interface SystemConsoleProps {
   stock: StockConfig;
   tool: ToolConfig;
   simulation: SimulationResult | null;
+  computeProgress: number;
+  playbackState: string;
+  queueLength: number;
+  bufferedMs: number;
 }
 
 export function SystemConsole({
@@ -30,7 +34,11 @@ export function SystemConsole({
   overview,
   stock,
   tool,
-  simulation
+  simulation,
+  computeProgress,
+  playbackState,
+  queueLength,
+  bufferedMs
 }: SystemConsoleProps) {
   return (
     <details className="panel-card console-panel details-card">
@@ -40,8 +48,9 @@ export function SystemConsole({
         <span className={`console-badge ${isSimulating ? "running" : "idle"}`}>
           {isSimulating ? "仿真中" : "空闲"}
         </span>
-        <span className="console-badge neutral">阶段: {phase}</span>
-        <span className="console-badge neutral">进度: {progress}%</span>
+        <span className="console-badge neutral">阶段：{phase}</span>
+        <span className="console-badge neutral">播放：{progress}%</span>
+        <span className="console-badge neutral">计算：{computeProgress}%</span>
       </div>
       <p className="console-status">{status}</p>
       <div className="console-grid">
@@ -50,8 +59,16 @@ export function SystemConsole({
           <ul className="console-kv">
             <li>文件：{fileName}</li>
             <li>耗时：{formatElapsed(elapsedMs)}</li>
+            <li>播放状态：{playbackState}</li>
+            <li>缓冲：{queueLength} 帧 / {bufferedMs.toFixed(0)} ms</li>
+          </ul>
+        </div>
+        <div className="console-section">
+          <h3>刀路统计</h3>
+          <ul className="console-kv">
             <li>轨迹：{overview.segmentCount} 段</li>
             <li>切削：{overview.cuttingSegmentCount} 段</li>
+            <li>圆弧离散：{overview.arcSegmentCount} 段</li>
           </ul>
         </div>
         <div className="console-section">
@@ -61,6 +78,7 @@ export function SystemConsole({
               尺寸：{stock.widthMm} x {stock.heightMm} x {stock.thicknessMm} mm
             </li>
             <li>精度：{stock.resolutionMm} mm</li>
+            <li>原点：({stock.originXMm}, {stock.originYMm})</li>
           </ul>
         </div>
         <div className="console-section">
@@ -74,12 +92,9 @@ export function SystemConsole({
         <div className="console-section">
           <h3>结果摘要</h3>
           <ul className="console-kv">
-            <li>圆弧离散：{overview.arcSegmentCount} 段</li>
             <li>网格：{simulation ? `${simulation.gridWidth} x ${simulation.gridHeight}` : "-"}</li>
-            <li>
-              去除体积：
-              {simulation ? `${simulation.removedVolumeMm3.toFixed(1)} mm³` : "-"}
-            </li>
+            <li>去除体积：{simulation ? `${simulation.removedVolumeMm3.toFixed(1)} mm³` : "-"}</li>
+            <li>高度范围：{simulation ? `${simulation.minSurfaceZMm.toFixed(2)} 到 ${simulation.maxSurfaceZMm.toFixed(2)} mm` : "-"}</li>
           </ul>
         </div>
       </div>

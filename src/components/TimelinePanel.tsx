@@ -10,6 +10,10 @@ interface TimelinePanelProps {
   progress: number;
   speedMultiplier: number;
   onSpeedChange: (speed: number) => void;
+  playbackState: string;
+  computeProgress: number;
+  queueLength: number;
+  bufferedMs: number;
 }
 
 const SPEED_STEPS = [1, 2, 4, 8, 12, 16, 24, 32];
@@ -23,7 +27,11 @@ export function TimelinePanel({
   isSimulating,
   progress,
   speedMultiplier,
-  onSpeedChange
+  onSpeedChange,
+  playbackState,
+  computeProgress,
+  queueLength,
+  bufferedMs
 }: TimelinePanelProps) {
   const speedIndex = Math.max(0, SPEED_STEPS.findIndex((value) => value === speedMultiplier));
 
@@ -59,7 +67,7 @@ export function TimelinePanel({
           className="field-label"
           style={{ display: "flex", alignItems: "center", gap: "12px", fontSize: "12px" }}
         >
-          <span>仿真速度</span>
+          <span>播放速度</span>
           <input
             type="range"
             min="0"
@@ -67,10 +75,14 @@ export function TimelinePanel({
             step="1"
             value={speedIndex}
             onChange={(e) => onSpeedChange(SPEED_STEPS[Number(e.target.value)] ?? 1)}
-            style={{ width: "140px" }}
+            style={{ width: "160px" }}
           />
           <span>{speedMultiplier}x</span>
         </label>
+        <span>播放状态：{playbackState}</span>
+        <span>计算进度：{computeProgress}%</span>
+        <span>缓冲帧：{queueLength}</span>
+        <span>缓冲时长：{bufferedMs.toFixed(0)} ms</span>
         {simulation ? (
           <>
             <span>{simulation.overview.segmentCount} 段轨迹</span>
