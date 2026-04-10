@@ -14,6 +14,7 @@ export interface ToolConfig {
   toolType: ToolType;
   diameterMm: number;
   angleDeg: number;
+  tipDiameterMm: number;
 }
 
 export interface MotionPoint {
@@ -311,6 +312,10 @@ export async function simulateGcodeWithProgress(
   let accumulatedDirtyRange: DirtyRange | null = null;
   let segmentsSincePreview = 0;
   let lastPreviewPoint: MotionPoint | null = null;
+  
+  // Estimate base duration: ~0.2ms per segment for typical CNC programs
+  // This gives reasonable playback times: 80000 segments ≈ 16 seconds at 1x
+  const baseDurationMs = Math.max(1000, totalSegments * 0.2);
 
   onProgress?.({
     stage: "准备仿真",
@@ -335,6 +340,7 @@ export async function simulateGcodeWithProgress(
         gridWidth,
         gridHeight,
         previewResolutionMm,
+        speed,
         (row, col) => {
           dirtyRange = mergeDirtyRange(dirtyRange, row, col);
         }
@@ -351,8 +357,10 @@ export async function simulateGcodeWithProgress(
     }
     segmentsSincePreview += end - start;
 
-    // Keep preview generation dense and deterministic; playback speed is controlled on the main thread.
-    const reportIntervalMs = 80;
+    // Control preview emission frequency based on speed multiplier
+    // Higher speeds emit fewer frames to maintain smooth playback
+    const baseIntervalMs = 150; // Increased from 80ms to reduce frame rate
+    const reportIntervalMs = speed >= 16 ? baseIntervalMs * 4 : speed >= 8 ? baseIntervalMs * 2 : baseIntervalMs;
 
     if (completedSegments >= totalSegments || now - lastReportAt >= reportIntervalMs) {
       onProgress?.({
@@ -365,15 +373,25 @@ export async function simulateGcodeWithProgress(
       lastReportAt = now;
     }
 
+    // Emit preview frames with balanced frequency for smooth visualization
+    // Target: smooth animation without excessive frame generation
+    const minSegmentsBetweenFrames = Math.max(50, Math.floor(totalSegments / 200));
+    const timeSinceLastFrame = now - (lastPreviewPoint ? lastReportAt : 0);
+    const minTimeBetweenFrames = 30; // Minimum 30ms between frames (~30fps)
+    
     const shouldEmitPreview =
       accumulatedDirtyRange !== null &&
       (completedSegments >= totalSegments ||
-        segmentsSincePreview >= derivePreviewEmitSegmentThreshold(speed) ||
-        movedEnoughForPreview(lastPreviewPoint, currentPoint, previewResolutionMm) ||
-        dirtyRangeLargeEnough(accumulatedDirtyRange, gridWidth, gridHeight));
+        (segmentsSincePreview >= minSegmentsBetweenFrames && timeSinceLastFrame >= minTimeBetweenFrames));
 
     if (shouldEmitPreview && accumulatedDirtyRange) {
-      const summary = summarizeHeights(heights, previewResolutionMm);
+      // Apply smoothing to preview frame for anti-aliased visualization
+      const smoothedHeights = postProcessHeights(heights, gridWidth, gridHeight, stock);
+      const summary = summarizeHeights(smoothedHeights, previewResolutionMm);
+      
+      // Calculate timeline position based on progress percentage
+      const timelineMs = (percent / 100) * baseDurationMs;
+      
       onPreview?.({
         overview,
         frameIndex: previewFrameIndex,
@@ -382,7 +400,7 @@ export async function simulateGcodeWithProgress(
         percent,
         currentPoint,
         generatedAtMs: now,
-        timelineMs: previewFrameIndex * 16,
+        timelineMs,
         gridWidth,
         gridHeight,
         stock,
@@ -391,12 +409,13 @@ export async function simulateGcodeWithProgress(
         maxSurfaceZMm: summary.maxSurfaceZMm,
         removedVolumeMm3: summary.removedVolumeMm3,
         estimatedCutPixels,
-        patch: buildSimulationPatch(heights, accumulatedDirtyRange, gridWidth)
+        patch: buildSimulationPatch(smoothedHeights, accumulatedDirtyRange, gridWidth)
       });
       previewFrameIndex += 1;
       accumulatedDirtyRange = null;
       segmentsSincePreview = 0;
       lastPreviewPoint = currentPoint;
+      lastReportAt = now; // Reset timer for next frame
     }
 
     start += batchSize;
@@ -455,7 +474,8 @@ function runSimulationCore(
       heights,
       gridWidth,
       gridHeight,
-      resolutionMm
+      resolutionMm,
+      1.0
     );
   });
 
@@ -510,7 +530,9 @@ function postProcessHeights(
   stock: StockConfig
 ): HeightBuffer {
   let current: HeightBuffer = new Float32Array(heights);
-  const passes = stock.resolutionMm <= 0.08 ? 1 : 0;
+  // Apply moderate smoothing only for very fine resolutions to preserve accuracy
+  // Single pass is enough to reduce aliasing without losing detail
+  const passes = stock.resolutionMm <= 0.05 ? 1 : 0;
 
   for (let pass = 0; pass < passes; pass += 1) {
     current = smoothHeightField(current, gridWidth, gridHeight, stock.thicknessMm);
@@ -536,7 +558,8 @@ function smoothHeightField(
     for (let col = 1; col < gridWidth - 1; col += 1) {
       const index = row * gridWidth + col;
       const center = source[index];
-      if (center > -0.015) {
+      // Smooth all cut areas, not just deep cuts
+      if (center > 0) {
         continue;
       }
 
@@ -546,7 +569,8 @@ function smoothHeightField(
         for (let kx = -1; kx <= 1; kx += 1) {
           const sample = source[(row + ky) * gridWidth + (col + kx)];
           const kernelWeight = kernel[ky + 1][kx + 1];
-          const similarity = 1 / (1 + Math.abs(sample - center) * 18);
+          // Moderate similarity weighting to preserve detail while reducing noise
+          const similarity = 1 / (1 + Math.abs(sample - center) * 15);
           const weight = kernelWeight * similarity;
           sum += sample * weight;
           weightSum += weight;
@@ -554,7 +578,8 @@ function smoothHeightField(
       }
 
       const blended = sum / Math.max(0.0001, weightSum);
-      target[index] = Math.max(-thicknessMm, Math.min(center * 0.82 + blended * 0.18, 0));
+      // Conservative blend: 35% smoothed, 65% original to maintain tool path fidelity
+      target[index] = Math.max(-thicknessMm, Math.min(center * 0.65 + blended * 0.35, 0));
     }
   }
 
@@ -572,7 +597,9 @@ function waitForNextFrame(): Promise<void> {
 }
 
 function derivePreviewResolution(stock: StockConfig, tool: ToolConfig): number {
-  return Math.max(stock.resolutionMm, Math.min(tool.diameterMm / 24, 0.12));
+  // Use higher resolution for preview to match final simulation quality
+  // Same as backend: tool.diameter_mm / 40.0 for anti-aliasing
+  return Math.max(stock.resolutionMm, Math.min(tool.diameterMm / 40, 0.08));
 }
 
 function deriveFinalResolution(stock: StockConfig, tool: ToolConfig): number {
@@ -580,19 +607,14 @@ function deriveFinalResolution(stock: StockConfig, tool: ToolConfig): number {
 }
 
 function derivePreviewBatchSize(speed: number, totalSegments: number): number {
-  if (speed <= 1) {
-    return Math.max(3, Math.min(6, Math.ceil(totalSegments / 2400) || 4));
-  }
-  if (speed <= 2) {
-    return 2;
-  }
-  if (speed <= 4) {
-    return 3;
-  }
-  if (speed <= 8) {
-    return 4;
-  }
-  return Math.max(4, Math.min(12, Math.ceil(totalSegments / 1200) || 6));
+  // At 1x: small batches (4-6) for smooth, stutter-free playback
+  // At higher speeds: scale up aggressively so simulation completes faster
+  const base = Math.max(3, Math.min(6, Math.ceil(totalSegments / 2400) || 4));
+  if (speed <= 1) return base;
+  if (speed <= 2) return base * 3;
+  if (speed <= 4) return base * 8;
+  if (speed <= 8) return base * 20;
+  return base * 40;
 }
 
 function derivePreviewEmitSegmentThreshold(speed: number): number {
@@ -680,6 +702,7 @@ function applySegment(
   gridWidth: number,
   gridHeight: number,
   resolutionMm: number,
+  speed: number = 1.0,
   onCellCut?: (row: number, col: number) => void
 ): number {
   const radius = tool.diameterMm * 0.5;
@@ -706,7 +729,8 @@ function applySegment(
         row,
         col,
         existingHeight,
-        resolutionMm
+        resolutionMm,
+        speed
       );
       if (nextHeight < existingHeight) {
         heights[cellIndex] = nextHeight;
@@ -733,7 +757,11 @@ function computeCutSurface(zTip: number, radial: number, tool: ToolConfig): numb
   if (halfAngle <= 0) {
     return zTip;
   }
-  return zTip + radial / halfAngle;
+  const tipRadius = (tool.tipDiameterMm ?? 0) * 0.5;
+  if (radial <= tipRadius) {
+    return zTip;
+  }
+  return zTip + (radial - tipRadius) / halfAngle;
 }
 
 function sampleSweptRemovalAtCell(
@@ -743,24 +771,28 @@ function sampleSweptRemovalAtCell(
   row: number,
   col: number,
   existingHeight: number,
-  resolutionMm: number
+  resolutionMm: number,
+  speed: number = 1.0
 ): number {
   const quarter = resolutionMm * 0.25;
   const edge = resolutionMm * 0.4;
   const centerX = stock.originXMm + col * resolutionMm;
   const centerY = stock.originYMm + row * resolutionMm;
   
-  const offsets: Array<[number, number]> = [
-    [0, 0],
-    [-quarter, -quarter],
-    [quarter, -quarter],
-    [-quarter, quarter],
-    [quarter, quarter],
-    [-edge, 0],
-    [edge, 0],
-    [0, -edge],
-    [0, edge]
-  ];
+  const offsets: Array<[number, number]> = 
+    speed >= 8 ? [[0, 0]] :
+    speed >= 4 ? [[0, 0], [-edge, 0], [edge, 0], [0, -edge], [0, edge]] :
+    [
+      [0, 0],
+      [-quarter, -quarter],
+      [quarter, -quarter],
+      [-quarter, quarter],
+      [quarter, quarter],
+      [-edge, 0],
+      [edge, 0],
+      [0, -edge],
+      [0, edge]
+    ];
 
   let best = existingHeight;
   for (const [ox, oy] of offsets) {

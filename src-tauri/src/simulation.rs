@@ -1,4 +1,4 @@
-use crate::gcode::{MotionPoint, MotionSegment, ParsedProgram};
+use crate::gcode::{MotionSegment, ParsedProgram};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +18,8 @@ pub struct ToolSpec {
     pub tool_type: ToolType,
     pub diameter_mm: f64,
     pub angle_deg: Option<f64>,
+    #[serde(default)]
+    pub tip_diameter_mm: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +124,10 @@ impl HeightField {
             cutting_segments += 1;
             estimated_cut_pixels += self.apply_segment(segment, tool)?;
         }
+
+        // Apply gentle smoothing to eliminate any remaining aliasing artifacts
+        // This mimics the natural smoothing that occurs in real CNC cutting
+        self.apply_smoothing_filter()?;
 
         let mut min_height = 0.0f64;
         let mut max_height = 0.0f64;
@@ -232,6 +238,53 @@ impl HeightField {
         Ok(affected)
     }
 
+    fn apply_smoothing_filter(&mut self) -> Result<(), String> {
+        // Apply moderate 3x3 smoothing filter to reduce aliasing while preserving accuracy
+        // Only smooth cells that have been cut (negative height)
+        // Use conservative blending to maintain fidelity to actual tool path
+        let mut smoothed = self.data.clone();
+        
+        for row in 1..(self.rows - 1) {
+            for col in 1..(self.cols - 1) {
+                let idx = row * self.cols + col;
+                
+                // Skip uncut cells
+                if self.data[idx] >= 0.0 {
+                    continue;
+                }
+
+                // Collect 3x3 neighborhood with Gaussian-like weights
+                let mut sum = 0.0f64;
+                let mut weight_sum = 0.0f64;
+                
+                for dr in -1..=1 {
+                    for dc in -1..=1 {
+                        let neighbor_idx = ((row as isize + dr) as usize) * self.cols 
+                            + ((col as isize + dc) as usize);
+                        let val = self.data[neighbor_idx];
+                        
+                        // Gaussian-like kernel: center=4, adjacent=2, corner=1
+                        let w = match (dr.abs(), dc.abs()) {
+                            (0, 0) => 4.0,  // center
+                            (0, 1) | (1, 0) => 2.0,  // adjacent
+                            _ => 1.0,  // corners
+                        };
+                        
+                        sum += val as f64 * w;
+                        weight_sum += w;
+                    }
+                }
+
+                let avg = sum / weight_sum;
+                // Conservative blend: 40% smoothed, 60% original to preserve tool path accuracy
+                smoothed[idx] = (avg * 0.4 + self.data[idx] as f64 * 0.6) as f32;
+            }
+        }
+
+        self.data = smoothed;
+        Ok(())
+    }
+
 
 }
 
@@ -251,7 +304,12 @@ fn compute_cut_surface(z_tip: f64, radial: f64, tool: &ToolSpec) -> Result<f64, 
             if half_angle <= 0.0 {
                 return Err("V-bit angle must be positive".to_string());
             }
-            Ok(z_tip + radial / half_angle)
+            let tip_radius = tool.tip_diameter_mm.unwrap_or(0.0) * 0.5;
+            if radial <= tip_radius {
+                Ok(z_tip)
+            } else {
+                Ok(z_tip + (radial - tip_radius) / half_angle)
+            }
         }
     }
 }
@@ -326,11 +384,58 @@ fn compute_segment_cell_cut_surface(
         best = Some(best.unwrap_or(cut).min(cut));
     }
 
+    // Anti-aliasing: if we found a cut, slightly soften the edge
+    // This simulates the continuous nature of real cutting
+    if let Some(cut_height) = best {
+        if matches!(tool.tool_type, ToolType::BallNose | ToolType::VBit) {
+            if let Some(edge_factor) = compute_edge_softening(segment, center_x, center_y, radius) {
+                let softened = cut_height * (1.0 - edge_factor * 0.15);
+                return Ok(Some(softened.max(cut_height - 0.05)));
+            }
+        }
+    }
+
     Ok(best)
 }
 
+fn compute_edge_softening(
+    segment: &MotionSegment,
+    center_x: f64,
+    center_y: f64,
+    radius: f64,
+) -> Option<f64> {
+    // Calculate distance from cell center to tool path
+    let seg_dx = segment.end.x - segment.start.x;
+    let seg_dy = segment.end.y - segment.start.y;
+    let seg_len2 = seg_dx * seg_dx + seg_dy * seg_dy;
+    
+    if seg_len2 < f64::EPSILON {
+        return None;
+    }
+    
+    let seg_len = seg_len2.sqrt();
+    let nx = -seg_dy / seg_len;
+    let ny = seg_dx / seg_len;
+    
+    let dx = center_x - segment.start.x;
+    let dy = center_y - segment.start.y;
+    let dist_to_path = (dx * nx + dy * ny).abs();
+    
+    // Cells near the tool edge (within 15% of radius) get softening
+    let edge_threshold = radius * 0.85;
+    if dist_to_path > edge_threshold && dist_to_path <= radius {
+        let factor = (dist_to_path - edge_threshold) / (radius - edge_threshold);
+        return Some(factor.min(1.0));
+    }
+    
+    None
+}
+
 fn derive_effective_resolution(stock: &StockSpec, tool: &ToolSpec) -> f64 {
-    stock.resolution_mm.min(tool.diameter_mm / 20.0).clamp(0.02, 0.5)
+    // Use super-sampling for anti-aliasing: 40-50 samples across tool diameter
+    // This eliminates jagged edges by capturing the continuous nature of cutting
+    let supersample_resolution = tool.diameter_mm / 40.0;
+    stock.resolution_mm.min(supersample_resolution).clamp(0.01, 0.3)
 }
 
 fn append_triangle(output: &mut String, a: [f32; 3], b: [f32; 3], c: [f32; 3]) {

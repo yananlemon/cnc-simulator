@@ -87,6 +87,7 @@ export function SystemConsole({
             <li>类型：{formatToolType(tool.toolType)}</li>
             <li>直径：{tool.diameterMm} mm</li>
             <li>V 角：{tool.angleDeg} deg</li>
+            <li>刀尖直径：{tool.tipDiameterMm} mm</li>
           </ul>
         </div>
         <div className="console-section">

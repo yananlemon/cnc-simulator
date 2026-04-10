@@ -17,6 +17,7 @@ interface SidebarProps {
   onResetStock: () => void;
   showToolpath: boolean;
   onShowToolpathChange: (value: boolean) => void;
+  isLoading?: boolean;
 }
 
 export function Sidebar({
@@ -30,7 +31,8 @@ export function Sidebar({
   onToolChange,
   onResetStock,
   showToolpath,
-  onShowToolpathChange
+  onShowToolpathChange,
+  isLoading = false
 }: SidebarProps) {
   const updateStock = (key: keyof StockConfig, value: string) => {
     onStockChange({
@@ -57,7 +59,7 @@ export function Sidebar({
     <aside className="sidebar">
       <section className="panel-card">
         <h2>G-code 工作区</h2>
-        <p className="card-hint">{fileName}</p>
+        <p className="card-hint">{isLoading ? "🔄 正在解析..." : fileName}</p>
         <label className="field-label">
           G-code 内容
           <textarea
@@ -152,6 +154,16 @@ export function Sidebar({
               type="number"
               value={tool.angleDeg}
               onChange={(event) => updateToolNumber("angleDeg", event.target.value)}
+            />
+          </label>
+          <label className="field-label">
+            刀尖直径 (mm)
+            <input
+              type="number"
+              step="0.01"
+              min="0"
+              value={tool.tipDiameterMm}
+              onChange={(event) => updateToolNumber("tipDiameterMm", event.target.value)}
             />
           </label>
         </div>

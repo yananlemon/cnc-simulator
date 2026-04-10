@@ -177,6 +177,17 @@ fn release_simulation_job(job_id: u64, cache: tauri::State<'_, SimulationCacheSt
 }
 
 #[tauri::command]
+fn release_all_simulation_jobs(cache: tauri::State<'_, SimulationCacheState>) -> Result<usize, String> {
+    let mut jobs = cache
+        .jobs
+        .lock()
+        .map_err(|_| "simulation cache lock poisoned".to_string())?;
+    let count = jobs.len();
+    jobs.clear();
+    Ok(count)
+}
+
+#[tauri::command]
 async fn export_simulated_stl(request: SimulationRequest) -> Result<String, String> {
     spawn_blocking(move || export_stl(&request))
         .await
@@ -197,6 +208,7 @@ pub fn run() {
             get_simulation_job_status,
             get_simulation_tile,
             release_simulation_job,
+            release_all_simulation_jobs,
             export_simulated_stl
         ])
         .run(tauri::generate_context!())

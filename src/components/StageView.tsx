@@ -397,10 +397,10 @@ export function StageView({
     }
 
     previewState.mesh.visible = isSimulating;
-    previewState.frontWall.visible = false;
-    previewState.backWall.visible = false;
-    previewState.leftWall.visible = false;
-    previewState.rightWall.visible = false;
+    previewState.frontWall.visible = isSimulating;
+    previewState.backWall.visible = isSimulating;
+    previewState.leftWall.visible = isSimulating;
+    previewState.rightWall.visible = isSimulating;
     applyPreviewPatchToRelief(previewState, previewFrame, stock);
   }, [previewFrame, isSimulating, stock]);
 
@@ -503,7 +503,16 @@ function createReliefState(
   const backWall = createWallMesh(isPreview);
   const leftWall = createWallMesh(isPreview);
   const rightWall = createWallMesh(isPreview);
-  group.add(mesh, frontWall, backWall, leftWall, rightWall);
+
+  const bottomGeom = new PlaneGeometry(stock.widthMm, stock.heightMm);
+  bottomGeom.translate(stock.widthMm * 0.5, stock.heightMm * 0.5, 0);
+  bottomGeom.rotateY(Math.PI);
+  bottomGeom.translate(stock.widthMm, 0, 0);
+  
+  const bottomWall = createWallMesh(false);
+  bottomWall.geometry = bottomGeom;
+
+  group.add(mesh, frontWall, backWall, leftWall, rightWall, bottomWall);
   return {
     group,
     mesh,
@@ -562,11 +571,11 @@ function createWallMesh(isPreview: boolean): Mesh {
   const mesh = new Mesh(
     new BufferGeometry(),
     new MeshStandardMaterial({
-      color: isPreview ? "#d7b781" : "#8b7457",
+      color: "#8b7457",
       roughness: 0.88,
       metalness: 0.02,
-      transparent: isPreview,
-      opacity: isPreview ? 0.95 : 1,
+      transparent: false,
+      opacity: 1,
       polygonOffset: true,
       polygonOffsetFactor: isPreview ? -3 : -1,
       polygonOffsetUnits: isPreview ? -3 : -1

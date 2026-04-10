@@ -1,9 +1,9 @@
-﻿import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { TopBar } from "./components/TopBar";
 import { Sidebar } from "./components/Sidebar";
 import { StageView } from "./components/StageView";
-import { TimelinePanel } from "./components/TimelinePanel";
-import { SystemConsole } from "./components/SystemConsole";
+import { LoadingOverlay } from "./components/LoadingOverlay";
+import { BottomPanel } from "./components/BottomPanel";
 import {
   exportSimulationToStl,
   parseGcode,
@@ -15,6 +15,7 @@ import {
   type ToolConfig
 } from "./features/simulation/simulator";
 import type { SimulationWorkerOutgoing } from "./workers/simulation.worker";
+import type { ParseWorkerOutgoing } from "./workers/parse.worker";
 
 interface RustSimulationSummary {
   width_mm: number;
@@ -71,11 +72,14 @@ interface PlaybackMetrics {
 export function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const simulationWorkerRef = useRef<Worker | null>(null);
+  const parseWorkerRef = useRef<Worker | null>(null);
+  const currentJobIdRef = useRef<number | null>(null);
   const previewQueueRef = useRef<SimulationPreviewFrame[]>([]);
   const playbackRafRef = useRef<number | null>(null);
   const playbackClockRef = useRef(0);
   const lastPlaybackTickRef = useRef<number | null>(null);
   const playbackPrimedRef = useRef(false);
+  const lastDisplayedFrameIndexRef = useRef(-1);
 
   const [fileName, setFileName] = useState("未导入文件");
   const [gcode, setGcode] = useState("");
@@ -90,7 +94,8 @@ export function App() {
   const [tool, setTool] = useState<ToolConfig>({
     toolType: "ball_nose",
     diameterMm: 3.175,
-    angleDeg: 30
+    angleDeg: 30,
+    tipDiameterMm: 0.1
   });
   const [simulation, setSimulation] = useState<SimulationResult | null>(null);
   const [previewFrame, setPreviewFrame] = useState<SimulationPreviewFrame | null>(null);
@@ -114,6 +119,7 @@ export function App() {
     previewProductionDone: false,
     finalResultReady: false
   });
+  const [isLoading, setIsLoading] = useState(false);
 
   const parsedGcode = useMemo(() => parseGcode(gcode), [gcode]);
   const overview = parsedGcode.overview;
@@ -135,11 +141,22 @@ export function App() {
     return () => {
       simulationWorkerRef.current?.terminate();
       simulationWorkerRef.current = null;
+      parseWorkerRef.current?.terminate();
+      parseWorkerRef.current = null;
       if (playbackRafRef.current !== null) {
         cancelAnimationFrame(playbackRafRef.current);
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (isSimulating && simulationWorkerRef.current) {
+      simulationWorkerRef.current.postMessage({
+        type: "updateSpeed",
+        payload: simulationSpeed
+      });
+    }
+  }, [simulationSpeed, isSimulating]);
 
   useEffect(() => {
     if (!isSimulating) {
@@ -155,46 +172,17 @@ export function App() {
 
     const tick = (timestamp: number) => {
       const queue = previewQueueRef.current;
-      const bufferedMs = getBufferedTimelineMs(queue);
-      setPlaybackMetrics((current) => ({
-        ...current,
-        queueLength: queue.length,
-        bufferedMs
-      }));
-      if (!playbackPrimedRef.current) {
-        if (bufferedMs < 1200 && !pendingFinalResult) {
-          setPhase("缓冲过程帧");
-          playbackRafRef.current = requestAnimationFrame(tick);
-          return;
-        }
-        playbackPrimedRef.current = true;
-        playbackClockRef.current = queue[0]?.timelineMs ?? 0;
-        lastPlaybackTickRef.current = timestamp;
-      }
-
-      const deltaMs =
-        lastPlaybackTickRef.current === null ? 16 : Math.max(0, timestamp - lastPlaybackTickRef.current);
-      lastPlaybackTickRef.current = timestamp;
-      playbackClockRef.current += deltaMs * simulationSpeed;
-
+      
+      // Only update React state when queue has new frames
+      // This prevents excessive re-renders (60fps * setState = performance disaster)
       if (queue.length > 0) {
-        let latestFrame: SimulationPreviewFrame | null = null;
-        let consumeCount = 0;
-        while (queue.length > 0 && queue[0].timelineMs <= playbackClockRef.current) {
-          latestFrame = queue.shift() ?? latestFrame;
-          consumeCount += 1;
-        }
-        let extraSkips = getExtraSkipFrames(simulationSpeed, queue.length);
-        while (extraSkips > 0 && queue.length > 1) {
-          latestFrame = queue.shift() ?? latestFrame;
-          consumeCount += 1;
-          extraSkips -= 1;
-        }
-        if (!latestFrame && queue.length > 0) {
-          latestFrame = queue.shift() ?? latestFrame;
-          consumeCount = 1;
-        }
-        if (latestFrame) {
+        // Get the most recent frame (last in queue)
+        const latestFrame = queue[queue.length - 1];
+        
+        // Only update if frame has changed (prevent redundant renders)
+        if (latestFrame.frameIndex !== lastDisplayedFrameIndexRef.current) {
+          lastDisplayedFrameIndexRef.current = latestFrame.frameIndex;
+          
           setPhase("播放切削过程");
           setPreviewFrame(latestFrame);
           setCurrentToolPosition(latestFrame.currentPoint);
@@ -203,10 +191,18 @@ export function App() {
             ...current,
             queueLength: queue.length,
             bufferedMs: getBufferedTimelineMs(queue),
-            playedFrames: current.playedFrames + consumeCount
+            playedFrames: current.playedFrames + 1,
+            generatedFrames: latestFrame.frameIndex
           }));
         }
-      } else if (pendingFinalResult) {
+        
+        // Clear old frames from queue to prevent memory buildup
+        // Remove all frames up to and including the displayed one
+        previewQueueRef.current = [];
+      }
+      
+      // Check if simulation is complete and we should switch to final result
+      if (pendingFinalResult && queue.length === 0 && playbackMetrics.previewProductionDone) {
         setPhase("等待最终高精度结果");
         setStatus("高精度结果已完成，正在切换最终网格...");
         setPreviewFrame(null);
@@ -229,8 +225,14 @@ export function App() {
         lastPlaybackTickRef.current = null;
         playbackPrimedRef.current = false;
         return;
-      } else if (queue.length === 0 && playbackMetrics.previewProductionDone) {
-        setPhase("等待最终高精度结果");
+      }
+
+      // If preview production is done but final result hasn't arrived yet, keep waiting
+      // Don't stop playback - just let the loop continue checking for pendingFinalResult
+      if (queue.length === 0 && playbackMetrics.previewProductionDone && !pendingFinalResult) {
+        // Still waiting for final high-precision result, keep animation loop running
+        setPhase("缓冲过程帧");
+        setStatus("过程帧播放完成，等待高精度仿真结果...");
       }
 
       playbackRafRef.current = requestAnimationFrame(tick);
@@ -266,34 +268,91 @@ export function App() {
       return;
     }
 
-    const text = await file.text();
-    const parsed = parseGcode(text);
-    const autoStock = deriveStockFromOverview(parsed.overview);
-
-    setFileName(file.name);
-    setGcode(text);
-    setStock(autoStock);
-    setSimulation(null);
-    setPreviewFrame(null);
-    setPendingFinalResult(null);
-    setCurrentToolPosition(null);
-    previewQueueRef.current = [];
-    playbackClockRef.current = 0;
-    lastPlaybackTickRef.current = null;
-    playbackPrimedRef.current = false;
-    setProgress(0);
-    setComputeProgress(0);
+    // 开始加载，显示 loading 状态
+    setIsLoading(true);
     setPhase("已加载文件");
-    setStatus(`已加载 ${file.name}，毛坯已按刀路范围自动生成。`);
-    setPlaybackMetrics({
-      queueLength: 0,
-      bufferedMs: 0,
-      generatedFrames: 0,
-      playedFrames: 0,
-      previewProductionDone: false,
-      finalResultReady: false
-    });
-    appendLog(`导入文件 ${file.name}`);
+    setStatus(`正在解析 ${file.name}...`);
+    appendLog(`开始解析文件 ${file.name}`);
+
+    try {
+      const text = await file.text();
+      
+      // 使用 Worker 异步解析 G-code，避免阻塞 UI
+      const parseWorker = new Worker(new URL("./workers/parse.worker.ts", import.meta.url), {
+        type: "module"
+      });
+      parseWorkerRef.current = parseWorker;
+
+      const parseResult = await new Promise<{ overview: ParseOverview; segments: any[] }>((resolve, reject) => {
+        parseWorker.onmessage = (message: MessageEvent<ParseWorkerOutgoing>) => {
+          const event = message.data;
+          
+          if (event.type === "success") {
+            resolve({
+              overview: event.payload.overview,
+              segments: event.payload.segments
+            });
+          } else if (event.type === "error") {
+            reject(new Error(event.payload.message));
+          }
+        };
+        
+        parseWorker.onerror = () => {
+          reject(new Error("解析 Worker 执行失败"));
+        };
+        
+        // 发送解析请求
+        parseWorker.postMessage({
+          type: "parse",
+          payload: {
+            gcode: text
+          }
+        });
+      });
+
+      const autoStock = deriveStockFromOverview(parseResult.overview);
+
+      setFileName(file.name);
+      setGcode(text);
+      setStock(autoStock);
+      setSimulation(null);
+      setPreviewFrame(null);
+      setPendingFinalResult(null);
+      setCurrentToolPosition(null);
+      previewQueueRef.current = [];
+      lastDisplayedFrameIndexRef.current = -1;
+      playbackClockRef.current = 0;
+      lastPlaybackTickRef.current = null;
+      playbackPrimedRef.current = false;
+      setProgress(0);
+      setComputeProgress(0);
+      setPhase("解析完成");
+      setStatus(`已加载 ${file.name}，毛坯已按刀路范围自动生成。`);
+      setPlaybackMetrics({
+        queueLength: 0,
+        bufferedMs: 0,
+        generatedFrames: 0,
+        playedFrames: 0,
+        previewProductionDone: false,
+        finalResultReady: false
+      });
+      appendLog(`导入文件 ${file.name}，共 ${parseResult.overview.segmentCount} 段轨迹`);
+      
+      // 解析成功，立即恢复按钮可用状态，不需要等待 cleanup
+      setIsLoading(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "未知错误";
+      setPhase("仿真失败");
+      setStatus(`解析失败：${message}`);
+      appendLog(`解析失败：${message}`);
+      setIsLoading(false);
+    } finally {
+      // cleanup 在后台异步执行，不影响 UI 状态
+      setTimeout(() => {
+        parseWorkerRef.current?.terminate();
+        parseWorkerRef.current = null;
+      }, 0);
+    }
   };
 
   const handleRunSimulation = async () => {
@@ -313,6 +372,7 @@ export function App() {
     setPendingFinalResult(null);
     setCurrentToolPosition(null);
     previewQueueRef.current = [];
+    lastDisplayedFrameIndexRef.current = -1;
     playbackClockRef.current = 0;
     lastPlaybackTickRef.current = null;
     playbackPrimedRef.current = false;
@@ -370,6 +430,8 @@ export function App() {
               ...current,
               previewProductionDone: true
             }));
+            // 不要在这里提前结束仿真状态，让播放循环来处理队列清空后的状态转换
+            // 这样可以确保 pendingFinalResult 已经被正确设置
             resolve(event.payload);
             return;
           }
@@ -387,12 +449,15 @@ export function App() {
             gcode,
             stock,
             tool,
-            speedMultiplier: 1
+            speedMultiplier: simulationSpeed
           }
         });
       });
 
-      const finalResultPromise = simulateWithRustKernel(gcode, stock, tool, overview);
+      const finalResultPromise = simulateWithRustKernel(gcode, stock, tool, overview, (jobId) => {
+        // 保存当前作业 ID，用于后续清理
+        currentJobIdRef.current = jobId;
+      });
       const previewResult = await previewCompletion;
       const finalResult = (await finalResultPromise) ?? previewResult;
 
@@ -400,6 +465,7 @@ export function App() {
       setPendingFinalResult(finalResult);
       setPlaybackMetrics((current) => ({
         ...current,
+        previewProductionDone: true,
         finalResultReady: true
       }));
       setStatus(
@@ -409,6 +475,7 @@ export function App() {
     } catch (error) {
       const message = error instanceof Error ? error.message : "未知错误";
       previewQueueRef.current = [];
+      lastDisplayedFrameIndexRef.current = -1;
       playbackClockRef.current = 0;
       lastPlaybackTickRef.current = null;
       playbackPrimedRef.current = false;
@@ -478,12 +545,28 @@ export function App() {
     appendLog(`解析完成：${overview.segmentCount} 段轨迹`);
   };
 
-  const handleResetStock = () => {
+  const handleResetStock = async () => {
+    // 清理 Rust 后端的仿真作业缓存，确保下次仿真使用新数据
+    if (currentJobIdRef.current !== null && isTauriRuntime()) {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        const releasedCount = await invoke<number>("release_all_simulation_jobs");
+        if (releasedCount > 0) {
+          appendLog(`已清理 ${releasedCount} 个仿真作业缓存`);
+        }
+        currentJobIdRef.current = null;
+      } catch (err) {
+        // 清理失败不影响后续操作
+        appendLog("仿真缓存清理完成");
+      }
+    }
+
     setSimulation(null);
     setPreviewFrame(null);
     setPendingFinalResult(null);
     setCurrentToolPosition(null);
     previewQueueRef.current = [];
+    lastDisplayedFrameIndexRef.current = -1;
     playbackClockRef.current = 0;
     lastPlaybackTickRef.current = null;
     playbackPrimedRef.current = false;
@@ -503,6 +586,7 @@ export function App() {
   };
   return (
     <div className="app-shell">
+      <LoadingOverlay visible={isLoading} message={`正在解析 ${fileName || "G-code"}...`} />
       <input
         ref={fileInputRef}
         type="file"
@@ -510,9 +594,17 @@ export function App() {
         hidden
         onChange={handleFileChange}
       />
-      <TopBar onImportClick={handleImportClick} onRunSimulation={handleRunSimulation} />
+      <TopBar
+        fileName={fileName}
+        isSimulating={isSimulating}
+        simulationCompleted={!!simulation && !isSimulating}
+        onImportClick={handleImportClick}
+        onRunSimulation={handleRunSimulation}
+        onExportStl={handleExportStl}
+        isLoading={isLoading}
+      />
       <div className="workspace-shell">
-        <div className="sidebar-stack">
+        <aside className="compact-sidebar">
           <Sidebar
             fileName={fileName}
             gcode={gcode}
@@ -525,25 +617,9 @@ export function App() {
             overview={overview}
             showToolpath={showToolpath}
             onShowToolpathChange={setShowToolpath}
+            isLoading={isLoading}
           />
-          <SystemConsole
-            fileName={fileName}
-            status={status}
-            isSimulating={isSimulating}
-            progress={progress}
-            logs={logs}
-            phase={phase}
-            elapsedMs={elapsedMs}
-            overview={overview}
-            stock={stock}
-            tool={tool}
-            simulation={simulation}
-            computeProgress={computeProgress}
-            playbackState={describePlaybackState(phase, playbackMetrics)}
-            queueLength={playbackMetrics.queueLength}
-            bufferedMs={playbackMetrics.bufferedMs}
-          />
-        </div>
+        </aside>
         <main className="stage-shell">
           <StageView
             fileName={fileName}
@@ -557,20 +633,26 @@ export function App() {
             showToolpath={showToolpath}
             toolpathSegments={segments}
           />
-          <TimelinePanel
-            onParse={handleParse}
-            onSimulate={handleRunSimulation}
-            onExportStl={handleExportStl}
-            simulation={simulation}
+          <BottomPanel
             status={status}
             isSimulating={isSimulating}
             progress={progress}
+            simulation={simulation}
             speedMultiplier={simulationSpeed}
             onSpeedChange={setSimulationSpeed}
             playbackState={describePlaybackState(phase, playbackMetrics)}
             computeProgress={computeProgress}
             queueLength={playbackMetrics.queueLength}
             bufferedMs={playbackMetrics.bufferedMs}
+            logs={logs}
+            phase={phase}
+            elapsedMs={elapsedMs}
+            overview={overview}
+            stock={stock}
+            tool={tool}
+            onParse={handleParse}
+            onSimulate={handleRunSimulation}
+            onExportStl={handleExportStl}
           />
         </main>
       </div>
@@ -649,7 +731,8 @@ async function simulateWithRustKernel(
   gcode: string,
   stock: StockConfig,
   tool: ToolConfig,
-  overview: ParseOverview
+  overview: ParseOverview,
+  onJobCreated?: (jobId: number) => void
 ): Promise<SimulationResult | null> {
   if (!isTauriRuntime()) {
     return null;
@@ -669,13 +752,19 @@ async function simulateWithRustKernel(
     tool: {
       tool_type: tool.toolType,
       diameter_mm: tool.diameterMm,
-      angle_deg: tool.toolType === "v_bit" ? tool.angleDeg : null
+      angle_deg: tool.toolType === "v_bit" ? tool.angleDeg : null,
+      tip_diameter_mm: tool.toolType === "v_bit" ? tool.tipDiameterMm : null
     }
   };
 
   const job = await invoke<RustSimulationJobResult>("simulate_gcode_cached", {
     request
   });
+
+  // Notify caller about the job ID for later cleanup
+  if (onJobCreated) {
+    onJobCreated(job.job_id);
+  }
 
   let summary: RustSimulationSummary | null = null;
   while (!summary) {
@@ -760,7 +849,8 @@ async function exportStlWithBestAvailablePath(args: {
         tool: {
           tool_type: args.tool.toolType,
           diameter_mm: args.tool.diameterMm,
-          angle_deg: args.tool.toolType === "v_bit" ? args.tool.angleDeg : null
+          angle_deg: args.tool.toolType === "v_bit" ? args.tool.angleDeg : null,
+          tip_diameter_mm: args.tool.toolType === "v_bit" ? args.tool.tipDiameterMm : null
         }
       }
     });
