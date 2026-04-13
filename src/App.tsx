@@ -4,6 +4,8 @@ import { Sidebar } from "./components/Sidebar";
 import { StageView } from "./components/StageView";
 import { LoadingOverlay } from "./components/LoadingOverlay";
 import { BottomPanel } from "./components/BottomPanel";
+import { GcodeDrawer } from "./components/GcodeDrawer";
+import { HelpDialog } from "./components/HelpDialog";
 import {
   exportSimulationToStl,
   parseGcode,
@@ -70,6 +72,7 @@ interface PlaybackMetrics {
 }
 
 export function App() {
+  const appVersion = "0.1.0";
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const simulationWorkerRef = useRef<Worker | null>(null);
   const parseWorkerRef = useRef<Worker | null>(null);
@@ -120,6 +123,8 @@ export function App() {
     finalResultReady: false
   });
   const [isLoading, setIsLoading] = useState(false);
+  const [isGcodeDrawerOpen, setIsGcodeDrawerOpen] = useState(false);
+  const [isHelpOpen, setIsHelpOpen] = useState(false);
 
   const parsedGcode = useMemo(() => parseGcode(gcode), [gcode]);
   const overview = parsedGcode.overview;
@@ -319,6 +324,7 @@ export function App() {
       setPreviewFrame(null);
       setPendingFinalResult(null);
       setCurrentToolPosition(null);
+      setIsGcodeDrawerOpen(false);
       previewQueueRef.current = [];
       lastDisplayedFrameIndexRef.current = -1;
       playbackClockRef.current = 0;
@@ -595,10 +601,12 @@ export function App() {
         onChange={handleFileChange}
       />
       <TopBar
-        fileName={fileName}
+        fileName={gcode.trim() ? fileName : "未导入文件"}
         isSimulating={isSimulating}
         simulationCompleted={!!simulation && !isSimulating}
+        onOpenHelp={() => setIsHelpOpen(true)}
         onImportClick={handleImportClick}
+        onParse={handleParse}
         onRunSimulation={handleRunSimulation}
         onExportStl={handleExportStl}
         isLoading={isLoading}
@@ -610,13 +618,22 @@ export function App() {
             gcode={gcode}
             stock={stock}
             tool={tool}
-            onGcodeChange={setGcode}
+            simulation={simulation}
+            status={status}
+            playbackState={describePlaybackState(phase, playbackMetrics)}
+            computeProgress={computeProgress}
+            queueLength={playbackMetrics.queueLength}
+            bufferedMs={playbackMetrics.bufferedMs}
+            logs={logs}
+            phase={phase}
+            elapsedMs={elapsedMs}
             onStockChange={setStock}
             onToolChange={setTool}
             onResetStock={handleResetStock}
             overview={overview}
             showToolpath={showToolpath}
             onShowToolpathChange={setShowToolpath}
+            onOpenGcodeViewer={() => setIsGcodeDrawerOpen(true)}
             isLoading={isLoading}
           />
         </aside>
@@ -637,25 +654,24 @@ export function App() {
             status={status}
             isSimulating={isSimulating}
             progress={progress}
-            simulation={simulation}
+            simulationSegmentCount={simulation?.overview.segmentCount ?? null}
+            removedVolumeMm3={simulation?.removedVolumeMm3 ?? null}
             speedMultiplier={simulationSpeed}
             onSpeedChange={setSimulationSpeed}
             playbackState={describePlaybackState(phase, playbackMetrics)}
             computeProgress={computeProgress}
             queueLength={playbackMetrics.queueLength}
             bufferedMs={playbackMetrics.bufferedMs}
-            logs={logs}
-            phase={phase}
-            elapsedMs={elapsedMs}
-            overview={overview}
-            stock={stock}
-            tool={tool}
-            onParse={handleParse}
-            onSimulate={handleRunSimulation}
-            onExportStl={handleExportStl}
           />
         </main>
       </div>
+      <GcodeDrawer
+        open={isGcodeDrawerOpen}
+        fileName={fileName}
+        gcode={gcode}
+        onClose={() => setIsGcodeDrawerOpen(false)}
+      />
+      <HelpDialog open={isHelpOpen} version={appVersion} onClose={() => setIsHelpOpen(false)} />
     </div>
   );
 }
