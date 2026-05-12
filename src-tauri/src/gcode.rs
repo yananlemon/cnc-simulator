@@ -28,6 +28,8 @@ struct ModalState {
     x: f64,
     y: f64,
     z: f64,
+    s: f64,
+    is_m_345: Option<i32>,
     motion_mode: MotionMode,
     feed_rate: Option<f64>,
     absolute: bool,
@@ -46,6 +48,8 @@ impl Default for ModalState {
             x: 0.0,
             y: 0.0,
             z: 0.0,
+            s: 0.0,
+            is_m_345: None,
             motion_mode: MotionMode::Rapid,
             feed_rate: None,
             absolute: true,
@@ -55,6 +59,37 @@ impl Default for ModalState {
 }
 
 pub fn parse_gcode(input: &str) -> Result<ParsedProgram, String> {
+    let header = &input[0..(input.len().min(2048))].to_lowercase();
+    let is_laser_prefix = input.len() > 0 && (header.contains("laser") || header.contains("s-max"));
+    let has_g1_s = input.lines().take(500).any(|l| {
+        let upper = l.to_uppercase();
+        upper.contains("G1") && upper.contains('S')
+    });
+    let mut is_laser_mode = is_laser_prefix || has_g1_s;
+
+    // A real 3D CNC file uses Z axis frequently. Let's count Z commands in the first few hundred lines
+    let z_count = input.lines().take(1000).filter(|l| {
+        let upper = l.to_uppercase();
+        let comment_pos = upper.find(';').or_else(|| upper.find('(')).unwrap_or(upper.len());
+        upper[..comment_pos].split_whitespace().any(|t| t.starts_with('Z'))
+    }).count();
+
+    if z_count > 5 {
+        is_laser_mode = false;
+    }
+
+    let mut max_s = 1000.0;
+    if is_laser_mode {
+        let header = &input[0..(input.len().min(2048))];
+        if let Some(idx) = header.find("S-Max:") {
+            if let Some(val_str) = header[idx+6..].split_whitespace().next() {
+                if let Ok(v) = val_str.parse::<f64>() {
+                    max_s = (v).max(1.0);
+                }
+            }
+        }
+    }
+
     let mut state = ModalState::default();
     let mut segments = Vec::new();
     let mut min = MotionPoint {
@@ -76,7 +111,7 @@ pub fn parse_gcode(input: &str) -> Result<ParsedProgram, String> {
 
         let mut next = state;
         let tokens = tokenize(&cleaned);
-        let mut saw_motion_axis = false;
+        let mut has_z_command = false;
 
         for token in tokens {
             let Some(letter) = token.chars().next() else {
@@ -104,18 +139,40 @@ pub fn parse_gcode(input: &str) -> Result<ParsedProgram, String> {
                 },
                 'X' => {
                     next.x = resolve_axis(state.x, value, next);
-                    saw_motion_axis = true;
                 }
                 'Y' => {
                     next.y = resolve_axis(state.y, value, next);
-                    saw_motion_axis = true;
                 }
                 'Z' => {
                     next.z = resolve_axis(state.z, value, next);
-                    saw_motion_axis = true;
+                    has_z_command = true;
                 }
                 'F' => next.feed_rate = Some(value),
+                'S' => next.s = value,
+                'M' => {
+                    if value as i32 == 3 || value as i32 == 4 || value as i32 == 5 {
+                        next.is_m_345 = Some(value as i32);
+                    }
+                }
                 _ => {}
+            }
+        }
+
+        let mut saw_motion_axis = next.x != state.x || next.y != state.y || next.z != state.z;
+
+        if is_laser_mode && !has_z_command {
+            if Some(5) == next.is_m_345 {
+                next.s = 0.0;
+            }
+            if next.s > 0.0 && next.motion_mode == MotionMode::Linear {
+                let s_val = next.s.min(max_s);
+                let depth = 0.1f64.max((s_val / max_s) * 1.5);
+                next.z = -depth;
+            } else {
+                next.z = 0.0;
+            }
+            if next.z != state.z || next.s != state.s {
+                saw_motion_axis = true;
             }
         }
 

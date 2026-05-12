@@ -1,5 +1,6 @@
 mod gcode;
 mod simulation;
+pub mod motion_planner;
 
 use serde::Serialize;
 use std::{
@@ -209,7 +210,8 @@ pub fn run() {
             get_simulation_tile,
             release_simulation_job,
             release_all_simulation_jobs,
-            export_simulated_stl
+            export_simulated_stl,
+            motion_planner::estimate_machining_time
         ])
         .run(tauri::generate_context!())
         .expect("failed to run CNC Simulator");

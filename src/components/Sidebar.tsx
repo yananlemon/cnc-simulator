@@ -6,6 +6,7 @@ import type {
   ToolConfig,
   ToolType
 } from "../features/simulation/simulator";
+import type { MachineConfig, MachiningStatistics } from "../features/simulation/motionPlanner";
 
 interface SidebarProps {
   fileName: string;
@@ -14,6 +15,9 @@ interface SidebarProps {
   tool: ToolConfig;
   overview: ParseOverview;
   simulation: SimulationResult | null;
+  machiningStats: MachiningStatistics | null;
+  machineConfig: MachineConfig;
+  isEstimatingMachining: boolean;
   status: string;
   playbackState: string;
   computeProgress: number;
@@ -24,6 +28,7 @@ interface SidebarProps {
   elapsedMs: number;
   onStockChange: (value: StockConfig) => void;
   onToolChange: (value: ToolConfig) => void;
+  onMachineConfigChange: (value: MachineConfig) => void;
   onResetStock: () => void;
   showToolpath: boolean;
   onShowToolpathChange: (value: boolean) => void;
@@ -31,7 +36,7 @@ interface SidebarProps {
   isLoading?: boolean;
 }
 
-type SidebarPanel = "file" | "stock" | "tool" | "analysis" | "runtime";
+type SidebarPanel = "file" | "stock" | "tool" | "analysis" | "diagnostics" | "runtime";
 
 export function Sidebar({
   fileName,
@@ -40,6 +45,9 @@ export function Sidebar({
   tool,
   overview,
   simulation,
+  machiningStats,
+  machineConfig,
+  isEstimatingMachining,
   status,
   playbackState,
   computeProgress,
@@ -50,6 +58,7 @@ export function Sidebar({
   elapsedMs,
   onStockChange,
   onToolChange,
+  onMachineConfigChange,
   onResetStock,
   showToolpath,
   onShowToolpathChange,
@@ -79,6 +88,13 @@ export function Sidebar({
     onToolChange({
       ...tool,
       toolType: value as ToolType
+    });
+  };
+
+  const updateMachineNumber = (key: keyof MachineConfig, value: string) => {
+    onMachineConfigChange({
+      ...machineConfig,
+      [key]: Number(value)
     });
   };
 
@@ -113,6 +129,13 @@ export function Sidebar({
             onClick={() => setActivePanel("analysis")}
           >
             <span className="sidebar-nav-label">分析</span>
+          </button>
+          <button
+            type="button"
+            className={`sidebar-nav-button ${activePanel === "diagnostics" ? "active" : ""}`}
+            onClick={() => setActivePanel("diagnostics")}
+          >
+            <span className="sidebar-nav-label">动力学</span>
           </button>
           <button
             type="button"
@@ -328,6 +351,135 @@ export function Sidebar({
             </>
           ) : null}
 
+          {activePanel === "diagnostics" ? (
+            <>
+              <div className="sidebar-panel-header">
+                <div>
+                  <h2>加工预估与动力学</h2>
+                  <p className="card-hint">只用于时间预估，不改变仿真网格和刀路效果。</p>
+                </div>
+              </div>
+
+              <div className="field-grid compact-field-grid">
+                <label className="field-label">
+                  X 最大速度 (mm/min)
+                  <input
+                    type="number"
+                    min="1"
+                    value={machineConfig.max_v_x}
+                    onChange={(event) => updateMachineNumber("max_v_x", event.target.value)}
+                  />
+                </label>
+                <label className="field-label">
+                  Y 最大速度 (mm/min)
+                  <input
+                    type="number"
+                    min="1"
+                    value={machineConfig.max_v_y}
+                    onChange={(event) => updateMachineNumber("max_v_y", event.target.value)}
+                  />
+                </label>
+                <label className="field-label">
+                  Z 最大速度 (mm/min)
+                  <input
+                    type="number"
+                    min="1"
+                    value={machineConfig.max_v_z}
+                    onChange={(event) => updateMachineNumber("max_v_z", event.target.value)}
+                  />
+                </label>
+                <label className="field-label">
+                  X 加速度 (mm/s²)
+                  <input
+                    type="number"
+                    min="1"
+                    value={machineConfig.max_a_x}
+                    onChange={(event) => updateMachineNumber("max_a_x", event.target.value)}
+                  />
+                </label>
+                <label className="field-label">
+                  Y 加速度 (mm/s²)
+                  <input
+                    type="number"
+                    min="1"
+                    value={machineConfig.max_a_y}
+                    onChange={(event) => updateMachineNumber("max_a_y", event.target.value)}
+                  />
+                </label>
+                <label className="field-label">
+                  Z 加速度 (mm/s²)
+                  <input
+                    type="number"
+                    min="1"
+                    value={machineConfig.max_a_z}
+                    onChange={(event) => updateMachineNumber("max_a_z", event.target.value)}
+                  />
+                </label>
+                <label className="field-label">
+                  拐角偏差 (mm)
+                  <input
+                    type="number"
+                    step="0.001"
+                    min="0"
+                    value={machineConfig.junction_deviation}
+                    onChange={(event) => updateMachineNumber("junction_deviation", event.target.value)}
+                  />
+                </label>
+              </div>
+
+              {!machiningStats ? (
+                 <div className="card-hint" style={{ padding: '20px', textAlign: 'center' }}>
+                   {isLoading || isEstimatingMachining ? "正在生成数字孪生报告..." : "等待文件解析完成"}
+                 </div>
+              ) : (
+                <div className="analysis-list">
+                  <div className="analysis-item" style={{ fontSize: "1.1em", paddingBottom: "10px", borderBottom: "1px solid rgba(255,255,255,0.1)", marginBottom: "10px" }}>
+                    <span style={{ color: "#1fbfff" }}>物理加工总耗时</span>
+                    <strong style={{ color: "#1fbfff", fontSize: "1.2em" }}>{formatDuration(machiningStats.totalTimeSec)}</strong>
+                  </div>
+                  
+                  <div style={{ marginTop: 10, marginBottom: 5, fontSize: "0.85em", color: "#8a9eb3" }}>⏱️ 时间拆解</div>
+                  <div className="analysis-item">
+                    <span>切削运动</span>
+                    <strong>{formatDuration(machiningStats.cuttingTimeSec)} ({(machiningStats.cuttingTimeSec / Math.max(1, machiningStats.totalTimeSec) * 100).toFixed(1)}%)</strong>
+                  </div>
+                  <div className="analysis-item">
+                    <span>快移空走</span>
+                    <strong>{formatDuration(machiningStats.rapidTimeSec)} ({(machiningStats.rapidTimeSec / Math.max(1, machiningStats.totalTimeSec) * 100).toFixed(1)}%)</strong>
+                  </div>
+                  <div className="analysis-item">
+                    <span>主轴停滞/系统延时</span>
+                    <strong>{formatDuration(machiningStats.staticDelaySec)}</strong>
+                  </div>
+
+                  <div style={{ marginTop: 15, marginBottom: 5, fontSize: "0.85em", color: "#8a9eb3" }}>📏 动力与轨迹</div>
+                  <div className="analysis-item">
+                    <span>总移动里程</span>
+                    <strong>{(machiningStats.totalDistanceMm / 1000).toFixed(2)} 米</strong>
+                  </div>
+                  <div className="analysis-item">
+                    <span>最高突刺速度</span>
+                    <strong>{machiningStats.maxAchievedVelocity.toFixed(0)} mm/min</strong>
+                  </div>
+                  <div className="analysis-item tooltip-wrapper">
+                    <span>限速降速避震拐角</span>
+                    <strong>{machiningStats.velocityLimitedCorners} 处</strong>
+                  </div>
+                  
+                  <div style={{ marginTop: 15, marginBottom: 5, fontSize: "0.85em", color: "#8a9eb3" }}>📊 行为侦测</div>
+                  <div className="analysis-item">
+                    <span>独立运动指令块</span>
+                    <strong>{machiningStats.totalBlocks.toLocaleString()} 段</strong>
+                  </div>
+                  <div className="analysis-item">
+                    <span>Z 轴起落钻入频率</span>
+                    <strong style={{ color: machiningStats.zPlunges > 3000 ? "#ffb644" : "inherit" }}>{machiningStats.zPlunges.toLocaleString()} 次</strong>
+                  </div>
+                </div>
+              )}
+            </>
+          ) : null}
+
           {activePanel === "runtime" ? (
             <>
               <div className="sidebar-panel-header">
@@ -408,4 +560,12 @@ function formatElapsed(elapsedMs: number): string {
     .toString()
     .padStart(2, "0");
   return `${minutes}:${seconds.toString().padStart(2, "0")}.${milliseconds}`;
+}
+
+function formatDuration(totalSeconds: number): string {
+  if (totalSeconds <= 0) return "00:00:00";
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = Math.floor(totalSeconds % 60);
+  return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
 }

@@ -28,6 +28,7 @@ pub enum ToolType {
     BallNose,
     FlatEndMill,
     VBit,
+    Laser,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +292,7 @@ impl HeightField {
 fn compute_cut_surface(z_tip: f64, radial: f64, tool: &ToolSpec) -> Result<f64, String> {
     match tool.tool_type {
         ToolType::FlatEndMill => Ok(z_tip),
+        ToolType::Laser => Ok(z_tip),
         ToolType::BallNose => {
             let radius = tool.diameter_mm * 0.5;
             let offset = radius - (radius * radius - radial * radial).max(0.0).sqrt();

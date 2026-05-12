@@ -37,6 +37,7 @@ export interface ParseOverview {
   arcSegmentCount: number;
   min: MotionPoint;
   max: MotionPoint;
+  isLaserMode: boolean;
 }
 
 export interface SimulationResult {
@@ -99,6 +100,8 @@ interface ModalState {
   x: number;
   y: number;
   z: number;
+  s: number;
+  isM345?: number;
   rapid: boolean;
   motionType: "line" | "arc_cw" | "arc_ccw";
   absolute: boolean;
@@ -130,10 +133,41 @@ G0 Z5`;
 }
 
 export function parseGcode(gcode: string): { segments: MotionSegment[]; overview: ParseOverview } {
+  const isLaserPrefix = gcode.length > 0 && (/laser|S-Max/i.test(gcode.slice(0, 2048)));
+  const hasG1S = /G1[^\n]+S\d+(\.\d+)?/i.test(gcode.slice(0, 50000));
+  let isLaserMode = isLaserPrefix || hasG1S;
+  
+  const zMatches = gcode.slice(0, 30000).match(/Z[-\d]/gi);
+  if (zMatches && zMatches.length > 5) {
+    isLaserMode = false;
+  }
+  
+  let maxS = 1000;
+  if (isLaserMode) {
+    const sMaxMatch = gcode.slice(0, 2048).match(/S-Max:\s*(\d+)/i) || gcode.slice(0, 2048).match(/S:\s*(\d+)/i);
+    if (sMaxMatch && sMaxMatch[1]) {
+      maxS = Math.max(1, Number(sMaxMatch[1]));
+    } else {
+      // Find highest S value in file
+      const matches = gcode.matchAll(/S(\d+)/gi);
+      let localMaxS = 1;
+      for (const m of matches) {
+        const val = Number(m[1]);
+        if (!Number.isNaN(val) && val > localMaxS && val <= 10000) {
+          localMaxS = val;
+        }
+      }
+      if (localMaxS > 1) {
+        maxS = localMaxS;
+      }
+    }
+  }
+
   const state: ModalState = {
     x: 0,
     y: 0,
     z: 0,
+    s: 0,
     rapid: true,
     motionType: "line",
     absolute: true,
@@ -153,6 +187,7 @@ export function parseGcode(gcode: string): { segments: MotionSegment[]; overview
 
     const next: ModalState = { ...state };
     let moved = false;
+    let hasZCommand = false;
     let arcI: number | null = null;
     let arcJ: number | null = null;
 
@@ -197,6 +232,15 @@ export function parseGcode(gcode: string): { segments: MotionSegment[]; overview
         case "Z":
           next.z = resolveAxis(state.z, value, next);
           moved = true;
+          hasZCommand = true;
+          break;
+        case "S":
+          next.s = value;
+          break;
+        case "M":
+          if (value === 3 || value === 4 || value === 5) {
+            next.isM345 = value;
+          }
           break;
         case "I":
           arcI = value * next.unitScale;
@@ -208,6 +252,22 @@ export function parseGcode(gcode: string): { segments: MotionSegment[]; overview
           break;
       }
     });
+
+    if (isLaserMode && !hasZCommand) {
+      if (next.isM345 === 5) {
+        next.s = 0;
+      }
+      if (next.s > 0 && !next.rapid) {
+        const sVal = Math.min(next.s, maxS);
+        const intensity = sVal / maxS;
+        next.z = -intensity;
+      } else {
+        next.z = 0;
+      }
+      if (next.z !== state.z || next.s !== state.s) {
+        moved = true;
+      }
+    }
 
     if (moved) {
       const segmentList =
@@ -257,21 +317,22 @@ export function parseGcode(gcode: string): { segments: MotionSegment[]; overview
       cuttingSegmentCount,
       arcSegmentCount,
       min: hasBounds ? min : { ...DEFAULT_POINT },
-      max: hasBounds ? max : { ...DEFAULT_POINT }
+      max: hasBounds ? max : { ...DEFAULT_POINT },
+      isLaserMode
     }
   };
 }
 
 export function simulateGcode(gcode: string, stock: StockConfig, tool: ToolConfig): SimulationResult {
-  const finalResolutionMm = deriveFinalResolution(stock, tool);
   const { segments, overview, gridWidth, gridHeight, heights, estimatedCutPixels } = runSimulationCore(
     gcode,
     stock,
-    tool,
-    finalResolutionMm
+    tool
   );
+  
+  const finalResolutionMm = deriveFinalResolution(stock, tool, overview.isLaserMode);
 
-  const processedHeights = postProcessHeights(heights, gridWidth, gridHeight, stock);
+  const processedHeights = postProcessHeights(heights, gridWidth, gridHeight, stock, overview.isLaserMode);
   const summary = summarizeHeights(processedHeights, finalResolutionMm);
 
   return {
@@ -298,8 +359,10 @@ export async function simulateGcodeWithProgress(
 ): Promise<SimulationResult> {
   const speedGetter = typeof getSpeedMultiplier === "function" ? getSpeedMultiplier : () => getSpeedMultiplier;
   const { segments, overview } = parseGcode(gcode);
-  const previewResolutionMm = derivePreviewResolution(stock, tool);
-  const finalResolutionMm = deriveFinalResolution(stock, tool);
+  const isLaserMode = overview.isLaserMode;
+  const effectiveTool = isLaserMode ? { ...tool, toolType: "flat_end_mill" as ToolType, diameterMm: 0.15 } : tool;
+  const previewResolutionMm = derivePreviewResolution(stock, effectiveTool, isLaserMode);
+  const finalResolutionMm = deriveFinalResolution(stock, effectiveTool, isLaserMode);
   const gridWidth = Math.max(2, Math.ceil(stock.widthMm / previewResolutionMm) + 1);
   const gridHeight = Math.max(2, Math.ceil(stock.heightMm / previewResolutionMm) + 1);
   const heights = new Float32Array(gridWidth * gridHeight);
@@ -334,7 +397,7 @@ export async function simulateGcodeWithProgress(
     for (let index = start; index < end; index += 1) {
       estimatedCutPixels += applySegment(
         cuttingSegments[index],
-        tool,
+        effectiveTool,
         stock,
         heights,
         gridWidth,
@@ -386,7 +449,7 @@ export async function simulateGcodeWithProgress(
 
     if (shouldEmitPreview && accumulatedDirtyRange) {
       // Apply smoothing to preview frame for anti-aliased visualization
-      const smoothedHeights = postProcessHeights(heights, gridWidth, gridHeight, stock);
+      const smoothedHeights = postProcessHeights(heights, gridWidth, gridHeight, stock, isLaserMode);
       const summary = summarizeHeights(smoothedHeights, previewResolutionMm);
       
       // Calculate timeline position based on progress percentage
@@ -432,7 +495,8 @@ export async function simulateGcodeWithProgress(
     heights,
     gridWidth,
     gridHeight,
-    stock
+    stock,
+    isLaserMode
   );
   const summary = summarizeHeights(processedHeights, previewResolutionMm);
 
@@ -453,10 +517,13 @@ export async function simulateGcodeWithProgress(
 function runSimulationCore(
   gcode: string,
   stock: StockConfig,
-  tool: ToolConfig,
-  resolutionMm = stock.resolutionMm
+  tool: ToolConfig
 ) {
   const { segments, overview } = parseGcode(gcode);
+  const isLaserMode = overview.isLaserMode;
+  const effectiveTool = isLaserMode ? { ...tool, toolType: "flat_end_mill" as ToolType, diameterMm: 0.15 } : tool;
+  const resolutionMm = deriveFinalResolution(stock, effectiveTool, isLaserMode);
+  
   const gridWidth = Math.max(2, Math.ceil(stock.widthMm / resolutionMm) + 1);
   const gridHeight = Math.max(2, Math.ceil(stock.heightMm / resolutionMm) + 1);
   const heights = new Float32Array(gridWidth * gridHeight);
@@ -469,7 +536,7 @@ function runSimulationCore(
 
     estimatedCutPixels += applySegment(
       segment,
-      tool,
+      effectiveTool,
       stock,
       heights,
       gridWidth,
@@ -527,12 +594,13 @@ function postProcessHeights(
   heights: HeightBuffer,
   gridWidth: number,
   gridHeight: number,
-  stock: StockConfig
+  stock: StockConfig,
+  isLaserMode?: boolean
 ): HeightBuffer {
   let current: HeightBuffer = new Float32Array(heights);
   // Apply moderate smoothing only for very fine resolutions to preserve accuracy
   // Single pass is enough to reduce aliasing without losing detail
-  const passes = stock.resolutionMm <= 0.05 ? 1 : 0;
+  const passes = (stock.resolutionMm <= 0.05 && !isLaserMode) ? 1 : 0;
 
   for (let pass = 0; pass < passes; pass += 1) {
     current = smoothHeightField(current, gridWidth, gridHeight, stock.thicknessMm);
@@ -596,13 +664,15 @@ function waitForNextFrame(): Promise<void> {
   });
 }
 
-function derivePreviewResolution(stock: StockConfig, tool: ToolConfig): number {
+function derivePreviewResolution(stock: StockConfig, tool: ToolConfig, isLaserMode?: boolean): number {
   // Use higher resolution for preview to match final simulation quality
   // Same as backend: tool.diameter_mm / 40.0 for anti-aliasing
+  if (isLaserMode) return Math.max(0.01, Math.min(stock.resolutionMm, 0.1));
   return Math.max(stock.resolutionMm, Math.min(tool.diameterMm / 40, 0.08));
 }
 
-function deriveFinalResolution(stock: StockConfig, tool: ToolConfig): number {
+function deriveFinalResolution(stock: StockConfig, tool: ToolConfig, isLaserMode?: boolean): number {
+  if (isLaserMode) return Math.max(0.01, Math.min(stock.resolutionMm, 0.1));
   return Math.max(0.01, Math.min(stock.resolutionMm, tool.diameterMm / 20, 0.08));
 }
 
@@ -1032,3 +1102,5 @@ function triangleNormal(
     z: nz / length
   };
 }
+
+

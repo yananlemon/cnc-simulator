@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { TopBar } from "./components/TopBar";
 import { Sidebar } from "./components/Sidebar";
 import { StageView } from "./components/StageView";
@@ -16,6 +16,7 @@ import {
   type StockConfig,
   type ToolConfig
 } from "./features/simulation/simulator";
+import type { MachiningStatistics, MachineConfig } from "./features/simulation/motionPlanner";
 import type { SimulationWorkerOutgoing } from "./workers/simulation.worker";
 import type { ParseWorkerOutgoing } from "./workers/parse.worker";
 
@@ -77,6 +78,7 @@ export function App() {
   const simulationWorkerRef = useRef<Worker | null>(null);
   const parseWorkerRef = useRef<Worker | null>(null);
   const currentJobIdRef = useRef<number | null>(null);
+  const machiningEstimateRequestIdRef = useRef(0);
   const previewQueueRef = useRef<SimulationPreviewFrame[]>([]);
   const playbackRafRef = useRef<number | null>(null);
   const playbackClockRef = useRef(0);
@@ -100,7 +102,18 @@ export function App() {
     angleDeg: 30,
     tipDiameterMm: 0.1
   });
+  const [machineConfig, setMachineConfig] = useState<MachineConfig>({
+    max_v_x: 2000,
+    max_v_y: 2000,
+    max_v_z: 200,
+    max_a_x: 20,
+    max_a_y: 20,
+    max_a_z: 20,
+    junction_deviation: 0.01
+  });
   const [simulation, setSimulation] = useState<SimulationResult | null>(null);
+  const [machiningStats, setMachiningStats] = useState<MachiningStatistics | null>(null);
+  const [isEstimatingMachining, setIsEstimatingMachining] = useState(false);
   const [previewFrame, setPreviewFrame] = useState<SimulationPreviewFrame | null>(null);
   const [currentToolPosition, setCurrentToolPosition] = useState<MotionPoint | null>(null);
   const [status, setStatus] = useState("请先导入 G-code 文件。");
@@ -129,6 +142,16 @@ export function App() {
   const parsedGcode = useMemo(() => parseGcode(gcode), [gcode]);
   const overview = parsedGcode.overview;
   const segments = parsedGcode.segments;
+
+  const appendLog = useCallback((message: string) => {
+    const timestamp = new Date().toLocaleTimeString("zh-CN", {
+      hour12: false,
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit"
+    });
+    setLogs((current) => [`[${timestamp}] ${message}`, ...current].slice(0, 12));
+  }, []);
 
   useEffect(() => {
     if (!isSimulating || startedAt === null) {
@@ -162,6 +185,50 @@ export function App() {
       });
     }
   }, [simulationSpeed, isSimulating]);
+
+  useEffect(() => {
+    if (!gcode.trim() || !isTauriRuntime()) {
+      setMachiningStats(null);
+      setIsEstimatingMachining(false);
+      return;
+    }
+
+    const requestId = machiningEstimateRequestIdRef.current + 1;
+    machiningEstimateRequestIdRef.current = requestId;
+    setIsEstimatingMachining(true);
+
+    const timer = window.setTimeout(() => {
+      import("@tauri-apps/api/core").then(({ invoke }) => {
+        invoke<MachiningStatistics>("estimate_machining_time", {
+          gcode,
+          config: machineConfig
+        })
+          .then((stats) => {
+            if (machiningEstimateRequestIdRef.current !== requestId) {
+              return;
+            }
+            setMachiningStats(stats);
+            appendLog("数字孪生加工时间预估完成");
+          })
+          .catch((err) => {
+            if (machiningEstimateRequestIdRef.current !== requestId) {
+              return;
+            }
+            setMachiningStats(null);
+            appendLog(`加工时间预估失败：${err}`);
+          })
+          .finally(() => {
+            if (machiningEstimateRequestIdRef.current === requestId) {
+              setIsEstimatingMachining(false);
+            }
+          });
+      });
+    }, 250);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [appendLog, gcode, machineConfig]);
 
   useEffect(() => {
     if (!isSimulating) {
@@ -253,16 +320,6 @@ export function App() {
     };
   }, [isSimulating, simulationSpeed, pendingFinalResult, playbackMetrics.previewProductionDone]);
 
-  const appendLog = (message: string) => {
-    const timestamp = new Date().toLocaleTimeString("zh-CN", {
-      hour12: false,
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit"
-    });
-    setLogs((current) => [`[${timestamp}] ${message}`, ...current].slice(0, 12));
-  };
-
   const handleImportClick = () => {
     fileInputRef.current?.click();
   };
@@ -321,6 +378,7 @@ export function App() {
       setGcode(text);
       setStock(autoStock);
       setSimulation(null);
+      setMachiningStats(null);
       setPreviewFrame(null);
       setPendingFinalResult(null);
       setCurrentToolPosition(null);
@@ -346,6 +404,7 @@ export function App() {
       
       // 解析成功，立即恢复按钮可用状态，不需要等待 cleanup
       setIsLoading(false);
+
     } catch (error) {
       const message = error instanceof Error ? error.message : "未知错误";
       setPhase("仿真失败");
@@ -619,6 +678,9 @@ export function App() {
             stock={stock}
             tool={tool}
             simulation={simulation}
+            machiningStats={machiningStats}
+            machineConfig={machineConfig}
+            isEstimatingMachining={isEstimatingMachining}
             status={status}
             playbackState={describePlaybackState(phase, playbackMetrics)}
             computeProgress={computeProgress}
@@ -629,6 +691,7 @@ export function App() {
             elapsedMs={elapsedMs}
             onStockChange={setStock}
             onToolChange={setTool}
+            onMachineConfigChange={setMachineConfig}
             onResetStock={handleResetStock}
             overview={overview}
             showToolpath={showToolpath}

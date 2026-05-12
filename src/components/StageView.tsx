@@ -297,12 +297,13 @@ export function StageView({
     const range = Math.max(0.001, maxH - minH);
     const chunkSize = 24000;
     let cursor = 0;
+    const isLaserMode = simulation.overview.isLaserMode;
 
     const finalizeMesh = () => {
       reliefState.mesh.geometry.computeVertexNormals();
       reliefState.mesh.geometry.getAttribute("position").needsUpdate = true;
       reliefState.mesh.geometry.getAttribute("normal").needsUpdate = true;
-      updateReliefWalls(reliefState, stock, (row, col) => sampleDisplayHeight(simulation, row, col));
+      updateReliefWalls(reliefState, stock, (row, col) => isLaserMode ? 0 : sampleDisplayHeight(simulation, row, col));
       reliefState.mesh.visible = true;
       reliefState.frontWall.visible = true;
       reliefState.backWall.visible = true;
@@ -318,9 +319,16 @@ export function StageView({
         const row = Math.floor(index / reliefState.gridWidth);
         const col = index - row * reliefState.gridWidth;
         const sourceHeight = sampleDisplayHeight(simulation, row, col);
-        positions.setZ(index, stock.thicknessMm + sourceHeight);
-        const t = (sourceHeight - minH) / range;
-        colorAttr!.setXYZ(index, 0.12 + t * 0.83, 0.1 + t * 0.78, 0.08 + t * 0.67);
+        
+        if (isLaserMode) {
+          positions.setZ(index, stock.thicknessMm);
+          const t = Math.min(1, Math.max(0, -sourceHeight));
+          colorAttr!.setXYZ(index, 0.85 - t * 0.73, 0.73 - t * 0.63, 0.56 - t * 0.48);
+        } else {
+          positions.setZ(index, stock.thicknessMm + sourceHeight);
+          const t = (sourceHeight - minH) / range;
+          colorAttr!.setXYZ(index, 0.12 + t * 0.83, 0.1 + t * 0.78, 0.08 + t * 0.67);
+        }
       }
 
       positions.needsUpdate = true;
@@ -662,29 +670,31 @@ function applySimulationToRelief(
   const minH = simulation?.minSurfaceZMm ?? 0;
   const maxH = simulation?.maxSurfaceZMm ?? 0;
   const range = Math.max(0.001, maxH - minH);
+  const isLaserMode = simulation?.overview.isLaserMode ?? false;
 
   for (let row = 0; row < reliefState.gridHeight; row += 1) {
     for (let col = 0; col < reliefState.gridWidth; col += 1) {
       const index = row * reliefState.gridWidth + col;
       const sourceHeight = simulation ? sampleDisplayHeight(simulation, row, col) : 0;
-      positions.setZ(index, stock.thicknessMm + sourceHeight);
-
-      // Height-based vertex coloring: deep=nearly black, high=bright cream
-      const t = range > 0.001 ? (sourceHeight - minH) / range : 1;
-      // Deep color: rgb(0.12, 0.10, 0.08) -> High color: rgb(0.95, 0.88, 0.75)
-      colorAttr.setXYZ(
-        index,
-        0.12 + t * 0.83,
-        0.10 + t * 0.78,
-        0.08 + t * 0.67
-      );
+      
+      if (isLaserMode) {
+        positions.setZ(index, stock.thicknessMm);
+        const t = Math.min(1, Math.max(0, -sourceHeight));
+        colorAttr.setXYZ(index, 0.85 - t * 0.73, 0.73 - t * 0.63, 0.56 - t * 0.48);
+      } else {
+        positions.setZ(index, stock.thicknessMm + sourceHeight);
+        const t = range > 0.001 ? (sourceHeight - minH) / range : 1;
+        colorAttr.setXYZ(index, 0.12 + t * 0.83, 0.10 + t * 0.78, 0.08 + t * 0.67);
+      }
     }
   }
 
   positions.needsUpdate = true;
   colorAttr.needsUpdate = true;
   reliefState.mesh.geometry.computeVertexNormals();
-  updateReliefWalls(reliefState, stock, (row, col) => (simulation ? sampleDisplayHeight(simulation, row, col) : 0));
+  updateReliefWalls(reliefState, stock, (row, col) => 
+    (simulation && !isLaserMode ? sampleDisplayHeight(simulation, row, col) : 0)
+  );
   reliefState.fullDetailReady = true;
 }
 
@@ -714,6 +724,7 @@ function applyPreviewPatchToRelief(
   const minH = previewFrame.minSurfaceZMm;
   const maxH = previewFrame.maxSurfaceZMm;
   const range = maxH - minH;
+  const isLaserMode = previewFrame.overview.isLaserMode;
 
   for (let sourceRow = previewFrame.patch.minRow; sourceRow <= previewFrame.patch.maxRow; sourceRow += 1) {
     const rowOffset = sourceRow - previewFrame.patch.minRow;
@@ -724,15 +735,16 @@ function applyPreviewPatchToRelief(
       const patchIndex = rowOffset * patchWidth + colOffset;
       const vertexIndex = meshRow * reliefState.gridWidth + col;
       const h = previewFrame.patch.heights[patchIndex];
-      positions.setZ(vertexIndex, stock.thicknessMm + h);
-
-      const t = range > 0.001 ? (h - minH) / range : 1;
-      colorAttr.setXYZ(
-        vertexIndex,
-        0.12 + t * 0.83,
-        0.10 + t * 0.78,
-        0.08 + t * 0.67
-      );
+      
+      if (isLaserMode) {
+        positions.setZ(vertexIndex, stock.thicknessMm);
+        const t = Math.min(1, Math.max(0, -h));
+        colorAttr.setXYZ(vertexIndex, 0.85 - t * 0.73, 0.73 - t * 0.63, 0.56 - t * 0.48);
+      } else {
+        positions.setZ(vertexIndex, stock.thicknessMm + h);
+        const t = range > 0.001 ? (h - minH) / range : 1;
+        colorAttr.setXYZ(vertexIndex, 0.12 + t * 0.83, 0.10 + t * 0.78, 0.08 + t * 0.67);
+      }
     }
   }
 
