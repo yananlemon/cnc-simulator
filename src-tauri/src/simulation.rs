@@ -244,11 +244,11 @@ impl HeightField {
         // Only smooth cells that have been cut (negative height)
         // Use conservative blending to maintain fidelity to actual tool path
         let mut smoothed = self.data.clone();
-        
+
         for row in 1..(self.rows - 1) {
             for col in 1..(self.cols - 1) {
                 let idx = row * self.cols + col;
-                
+
                 // Skip uncut cells
                 if self.data[idx] >= 0.0 {
                     continue;
@@ -257,20 +257,20 @@ impl HeightField {
                 // Collect 3x3 neighborhood with Gaussian-like weights
                 let mut sum = 0.0f64;
                 let mut weight_sum = 0.0f64;
-                
+
                 for dr in -1..=1 {
                     for dc in -1..=1 {
-                        let neighbor_idx = ((row as isize + dr) as usize) * self.cols 
+                        let neighbor_idx = ((row as isize + dr) as usize) * self.cols
                             + ((col as isize + dc) as usize);
                         let val = self.data[neighbor_idx];
-                        
+
                         // Gaussian-like kernel: center=4, adjacent=2, corner=1
                         let w = match (dr.abs(), dc.abs()) {
-                            (0, 0) => 4.0,  // center
-                            (0, 1) | (1, 0) => 2.0,  // adjacent
-                            _ => 1.0,  // corners
+                            (0, 0) => 4.0,          // center
+                            (0, 1) | (1, 0) => 2.0, // adjacent
+                            _ => 1.0,               // corners
                         };
-                        
+
                         sum += val as f64 * w;
                         weight_sum += w;
                     }
@@ -285,8 +285,6 @@ impl HeightField {
         self.data = smoothed;
         Ok(())
     }
-
-
 }
 
 fn compute_cut_surface(z_tip: f64, radial: f64, tool: &ToolSpec) -> Result<f64, String> {
@@ -363,7 +361,7 @@ fn compute_segment_cell_cut_surface(
 
     let t_span = t_out - t_in;
     let physical_dist = t_span * seg_len2.sqrt();
-    
+
     let num_samples = match tool.tool_type {
         ToolType::FlatEndMill => 3,
         _ => {
@@ -374,9 +372,13 @@ fn compute_segment_cell_cut_surface(
 
     let mut best: Option<f64> = None;
     for i in 0..num_samples {
-        let frac = if num_samples <= 1 { 0.5 } else { i as f64 / (num_samples - 1) as f64 };
+        let frac = if num_samples <= 1 {
+            0.5
+        } else {
+            i as f64 / (num_samples - 1) as f64
+        };
         let t = t_in + frac * (t_out - t_in);
-        
+
         let p_z = segment.start.z + t * seg_dz;
         let dx = segment.start.x + t * seg_dx - center_x;
         let dy = segment.start.y + t * seg_dy - center_y;
@@ -410,26 +412,26 @@ fn compute_edge_softening(
     let seg_dx = segment.end.x - segment.start.x;
     let seg_dy = segment.end.y - segment.start.y;
     let seg_len2 = seg_dx * seg_dx + seg_dy * seg_dy;
-    
+
     if seg_len2 < f64::EPSILON {
         return None;
     }
-    
+
     let seg_len = seg_len2.sqrt();
     let nx = -seg_dy / seg_len;
     let ny = seg_dx / seg_len;
-    
+
     let dx = center_x - segment.start.x;
     let dy = center_y - segment.start.y;
     let dist_to_path = (dx * nx + dy * ny).abs();
-    
+
     // Cells near the tool edge (within 15% of radius) get softening
     let edge_threshold = radius * 0.85;
     if dist_to_path > edge_threshold && dist_to_path <= radius {
         let factor = (dist_to_path - edge_threshold) / (radius - edge_threshold);
         return Some(factor.min(1.0));
     }
-    
+
     None
 }
 
@@ -437,7 +439,10 @@ fn derive_effective_resolution(stock: &StockSpec, tool: &ToolSpec) -> f64 {
     // Use super-sampling for anti-aliasing: 40-50 samples across tool diameter
     // This eliminates jagged edges by capturing the continuous nature of cutting
     let supersample_resolution = tool.diameter_mm / 40.0;
-    stock.resolution_mm.min(supersample_resolution).clamp(0.01, 0.3)
+    stock
+        .resolution_mm
+        .min(supersample_resolution)
+        .clamp(0.01, 0.3)
 }
 
 fn append_triangle(output: &mut String, a: [f32; 3], b: [f32; 3], c: [f32; 3]) {
@@ -462,7 +467,11 @@ pub fn run_simulation(request: &SimulationRequest) -> Result<SimulationResult, S
     })
 }
 
-pub fn extract_tile(result: &SimulationResult, start_row: usize, row_count: usize) -> Result<SimulationTile, String> {
+pub fn extract_tile(
+    result: &SimulationResult,
+    start_row: usize,
+    row_count: usize,
+) -> Result<SimulationTile, String> {
     if row_count == 0 {
         return Err("row_count must be positive".to_string());
     }
@@ -492,4 +501,275 @@ pub fn export_stl(request: &SimulationRequest) -> Result<String, String> {
     let mut field = HeightField::new(&effective_stock)?;
     field.simulate(&program, &request.tool)?;
     Ok(field.export_ascii_stl("artimaker_stock"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gcode::{MotionPoint, MotionSegment, ParsedProgram};
+
+    // ——— 测试辅助构造函数 ———
+
+    /// 创建指定尺寸（宽、高、厚）的毛坯规格，分辨率固定为 1mm
+    fn make_stock(w: f64, h: f64, t: f64) -> StockSpec {
+        StockSpec {
+            width_mm: w,
+            height_mm: h,
+            thickness_mm: t,
+            resolution_mm: 1.0,
+            origin_x_mm: 0.0,
+            origin_y_mm: 0.0,
+        }
+    }
+
+    /// 创建平底铣刀（FlatEndMill）规格
+    fn make_flat_tool(diameter: f64) -> ToolSpec {
+        ToolSpec {
+            tool_type: ToolType::FlatEndMill,
+            diameter_mm: diameter,
+            angle_deg: None,
+            tip_diameter_mm: None,
+        }
+    }
+
+    /// 创建球头刀（BallNose）规格
+    fn make_ball_tool(diameter: f64) -> ToolSpec {
+        ToolSpec {
+            tool_type: ToolType::BallNose,
+            diameter_mm: diameter,
+            angle_deg: None,
+            tip_diameter_mm: None,
+        }
+    }
+
+    /// 创建一个运动段，start/end 坐标由参数给定
+    fn make_segment(
+        x0: f64,
+        y0: f64,
+        z0: f64,
+        x1: f64,
+        y1: f64,
+        z1: f64,
+        rapid: bool,
+    ) -> MotionSegment {
+        MotionSegment {
+            start: MotionPoint {
+                x: x0,
+                y: y0,
+                z: z0,
+            },
+            end: MotionPoint {
+                x: x1,
+                y: y1,
+                z: z1,
+            },
+            rapid,
+            feed_rate: None,
+            line_number: 1,
+        }
+    }
+
+    /// 将运动段列表包装为 ParsedProgram（包围盒使用占位值）
+    fn make_program(segments: Vec<MotionSegment>) -> ParsedProgram {
+        ParsedProgram {
+            segments,
+            min: MotionPoint {
+                x: 0.0,
+                y: 0.0,
+                z: -10.0,
+            },
+            max: MotionPoint {
+                x: 50.0,
+                y: 50.0,
+                z: 0.0,
+            },
+        }
+    }
+
+    // ——— 单元测试 ———
+
+    // 1. 负或零尺寸的毛坯应返回 Err，不应崩溃
+    #[test]
+    fn new_height_field_rejects_invalid_dimensions() {
+        // 宽度为 0
+        let s1 = StockSpec {
+            width_mm: 0.0,
+            height_mm: 10.0,
+            thickness_mm: 5.0,
+            resolution_mm: 1.0,
+            origin_x_mm: 0.0,
+            origin_y_mm: 0.0,
+        };
+        assert!(HeightField::new(&s1).is_err(), "宽度为 0 应报错");
+
+        // 高度为负数
+        let s2 = StockSpec {
+            width_mm: 10.0,
+            height_mm: -1.0,
+            thickness_mm: 5.0,
+            resolution_mm: 1.0,
+            origin_x_mm: 0.0,
+            origin_y_mm: 0.0,
+        };
+        assert!(HeightField::new(&s2).is_err(), "高度为负应报错");
+
+        // 厚度为 0
+        let s3 = StockSpec {
+            width_mm: 10.0,
+            height_mm: 10.0,
+            thickness_mm: 0.0,
+            resolution_mm: 1.0,
+            origin_x_mm: 0.0,
+            origin_y_mm: 0.0,
+        };
+        assert!(HeightField::new(&s3).is_err(), "厚度为 0 应报错");
+
+        // 分辨率为 0
+        let s4 = StockSpec {
+            width_mm: 10.0,
+            height_mm: 10.0,
+            thickness_mm: 5.0,
+            resolution_mm: 0.0,
+            origin_x_mm: 0.0,
+            origin_y_mm: 0.0,
+        };
+        assert!(HeightField::new(&s4).is_err(), "分辨率为 0 应报错");
+    }
+
+    // 2. 有效毛坯创建后，高度场所有格点初始高度均为 0
+    #[test]
+    fn new_height_field_all_zeros() {
+        let stock = make_stock(10.0, 10.0, 5.0);
+        let hf = HeightField::new(&stock).unwrap();
+        assert!(
+            hf.heights().iter().all(|&h| h == 0.0),
+            "新建高度场所有格点应初始化为 0.0"
+        );
+    }
+
+    // 3. 平底铣刀切削后，刀具覆盖区域内应出现负高度（切削有效）
+    #[test]
+    fn flat_end_mill_cuts_negative_depth() {
+        let stock = make_stock(10.0, 10.0, 5.0);
+        let tool = make_flat_tool(2.0); // 直径 2mm，半径 1mm
+                                        // 沿 y=5 横穿毛坯，刀尖 z=-1.0
+        let seg = make_segment(0.0, 5.0, -1.0, 10.0, 5.0, -1.0, false);
+        let prog = make_program(vec![seg]);
+        let mut hf = HeightField::new(&stock).unwrap();
+        let summary = hf.simulate(&prog, &tool).unwrap();
+        assert!(summary.min_height_mm < 0.0, "切削后最小高度应为负值");
+        // 切削段计数应为 1
+        assert_eq!(summary.cutting_segment_count, 1, "应有 1 个切削段");
+        // 移除体积应大于 0
+        assert!(summary.removed_volume_mm3 > 0.0, "切削应有体积移除");
+    }
+
+    // 4. 快速移动段（rapid=true）不执行切削，高度场保持全零
+    #[test]
+    fn rapid_segment_does_not_cut() {
+        let stock = make_stock(10.0, 10.0, 5.0);
+        let tool = make_flat_tool(2.0);
+        // 与切削测试相同路径，但 rapid=true
+        let seg = make_segment(0.0, 5.0, -1.0, 10.0, 5.0, -1.0, true);
+        let prog = make_program(vec![seg]);
+        let mut hf = HeightField::new(&stock).unwrap();
+        hf.simulate(&prog, &tool).unwrap();
+        // 快速移动不切削，平滑滤波也跳过零值格点，高度场应保持全零
+        assert!(
+            hf.heights().iter().all(|&h| h == 0.0),
+            "快速移动后高度场应保持全零"
+        );
+    }
+
+    // 5. 球头刀切削产生的深度不超过刀尖 Z 坐标（几何保证：offset >= 0）
+    #[test]
+    fn ball_nose_cut_depth_bounded() {
+        let stock = make_stock(20.0, 20.0, 5.0);
+        let tool = make_ball_tool(4.0); // 直径 4mm，半径 2mm
+                                        // 在 (10,10) 处定点切削，刀尖 z=-1.0
+        let seg = make_segment(10.0, 10.0, -1.0, 10.0, 10.0, -1.0, false);
+        let prog = make_program(vec![seg]);
+        let mut hf = HeightField::new(&stock).unwrap();
+        hf.simulate(&prog, &tool).unwrap();
+        // 球头刀 offset = radius - sqrt(radius^2 - radial^2) >= 0
+        // 所以 cut_height = z_tip + offset >= z_tip = -1.0
+        // 平滑只会使值趋向零（升高），允许微小浮点容差
+        let min_h = hf.heights().iter().cloned().fold(f32::INFINITY, f32::min);
+        assert!(
+            min_h as f64 >= -1.05,
+            "球头刀切深不应超过刀尖 z=-1.0，实际最小高度={min_h}"
+        );
+    }
+
+    // 6. simulate() 在有切削段时，removed_volume_mm3 应大于 0
+    #[test]
+    fn simulate_reports_nonzero_removed_volume() {
+        let stock = make_stock(20.0, 20.0, 5.0);
+        let tool = make_flat_tool(4.0); // 直径 4mm
+                                        // 沿 y=10 横穿，刀尖 z=-1.0
+        let seg = make_segment(0.0, 10.0, -1.0, 20.0, 10.0, -1.0, false);
+        let prog = make_program(vec![seg]);
+        let mut hf = HeightField::new(&stock).unwrap();
+        let summary = hf.simulate(&prog, &tool).unwrap();
+        assert!(
+            summary.removed_volume_mm3 > 0.0,
+            "切削后移除体积应大于 0，实际 {}",
+            summary.removed_volume_mm3
+        );
+    }
+
+    // 7. export_ascii_stl() 输出应包含合法的 "solid" 和 "endsolid" 头尾
+    #[test]
+    fn stl_export_has_solid_header() {
+        let stock = make_stock(10.0, 10.0, 5.0);
+        let hf = HeightField::new(&stock).unwrap();
+        let stl = hf.export_ascii_stl("test_part");
+        assert!(
+            stl.starts_with("solid test_part"),
+            "STL 应以 'solid <name>' 开头"
+        );
+        assert!(
+            stl.contains("endsolid test_part"),
+            "STL 应包含 'endsolid <name>'"
+        );
+        // 应包含至少一个三角面（facet）
+        assert!(stl.contains("facet normal"), "STL 应包含至少一个三角面");
+    }
+
+    // 8. 平底铣刀的 compute_cut_surface：切削面等于 z_tip，与径向距离无关
+    #[test]
+    fn compute_cut_surface_flat_end_mill() {
+        let tool = make_flat_tool(4.0);
+        let z_tip = -2.5;
+        // 在刀具中心（radial=0）
+        let result_center = compute_cut_surface(z_tip, 0.0, &tool).unwrap();
+        assert!(
+            (result_center - z_tip).abs() < 1e-9,
+            "平底铣刀中心切削面应等于 z_tip={z_tip}，实际 {result_center}"
+        );
+        // 在刀具边缘（radial=1.5mm）
+        let result_edge = compute_cut_surface(z_tip, 1.5, &tool).unwrap();
+        assert!(
+            (result_edge - z_tip).abs() < 1e-9,
+            "平底铣刀边缘切削面应等于 z_tip={z_tip}，实际 {result_edge}"
+        );
+    }
+
+    // 9. 刀具切削深度超出毛坯厚度时，高度场数据应被截断（clamp 生效）
+    #[test]
+    fn cut_depth_clamped_to_stock_thickness() {
+        let stock = make_stock(10.0, 10.0, 5.0); // 厚度 5mm
+        let tool = make_flat_tool(4.0); // 直径 4mm
+                                        // 刀尖 z=-100，远超毛坯厚度，apply_segment 内 clamp 至 -thickness=-5.0
+        let seg = make_segment(5.0, 5.0, -100.0, 5.0, 5.0, -100.0, false);
+        let prog = make_program(vec![seg]);
+        let mut hf = HeightField::new(&stock).unwrap();
+        hf.simulate(&prog, &tool).unwrap();
+        // 所有格点高度应 >= -thickness_mm（平滑只会使值更接近零）
+        let min_h = hf.heights().iter().cloned().fold(f32::INFINITY, f32::min);
+        assert!(
+            min_h as f64 >= -5.0 - 1e-4,
+            "切削深度应被截断至毛坯厚度 5.0mm，实际最小高度={min_h:.4}"
+        );
+    }
 }
